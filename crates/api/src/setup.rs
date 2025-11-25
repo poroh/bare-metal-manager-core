@@ -62,6 +62,7 @@ use crate::logging::sqlx_query_tracing::SQLX_STATEMENTS_LOG_LEVEL;
 use crate::machine_update_manager::MachineUpdateManager;
 use crate::measured_boot::metrics_collector::MeasuredBootMetricsCollector;
 use crate::mqtt_state_change_hook::hook::MqttStateChangeHook;
+use crate::nv_redfish::NvRedfishClientPool;
 use crate::nvl_partition_monitor::NvlPartitionMonitor;
 use crate::nvlink::{NmxmClientPool, NmxmClientPoolImpl};
 use crate::preingestion_manager::PreingestionManager;
@@ -213,11 +214,13 @@ async fn create_and_connect_postgres_pool(config: &CarbideConfig) -> eyre::Resul
 }
 
 #[tracing::instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn start_api(
     carbide_config: Arc<CarbideConfig>,
     meter: Meter,
     dynamic_settings: DynamicSettings,
     shared_redfish_pool: Arc<dyn RedfishClientPool>,
+    shared_nv_redfish_pool: Arc<NvRedfishClientPool>,
     vault_client: Arc<ForgeVaultClient>,
     stop_channel: Receiver<()>,
     ready_channel: Sender<()>,
@@ -355,12 +358,14 @@ pub async fn start_api(
 
     let bmc_explorer = Arc::new(BmcEndpointExplorer::new(
         shared_redfish_pool.clone(),
+        shared_nv_redfish_pool,
         ipmi_tool.clone(),
         vault_client.clone(),
         carbide_config
             .site_explorer
             .rotate_switch_nvos_credentials
             .clone(),
+        carbide_config.site_explorer.explore_mode,
     ));
 
     let nvlink_config = carbide_config.nvlink_config.clone().unwrap_or_default();

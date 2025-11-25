@@ -22,6 +22,9 @@
 // It's too cumbersome for tests to adhere to these, which are less important in testing anyway.
 #![cfg_attr(test, allow(txn_held_across_await))]
 #![cfg_attr(test, allow(txn_without_commit))]
+// Needed for nv-redfish that requires deep recursion for Redfish
+// object type tree.
+#![recursion_limit = "256"]
 
 // NOTE on pub vs non-pub mods:
 //
@@ -58,6 +61,7 @@ mod machine_validation;
 mod measured_boot;
 mod mqtt_state_change_hook;
 mod network_segment;
+mod nv_redfish;
 mod nvl_partition_monitor;
 mod nvlink;
 mod preingestion_manager;

@@ -23,6 +23,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use carbide_dpf::KubeImpl;
 use carbide_uuid::instance::InstanceId;
@@ -84,9 +85,9 @@ use crate::cfg::file::{
     IbPartitionStateControllerConfig, ListenMode, MachineStateControllerConfig, MachineUpdater,
     MachineValidationConfig, MeasuredBootMetricsCollectorConfig, NetworkSecurityGroupConfig,
     NetworkSegmentStateControllerConfig, NvLinkConfig, PowerManagerOptions,
-    PowerShelfStateControllerConfig, RackStateControllerConfig, SiteExplorerConfig, SpdmConfig,
-    SpdmStateControllerConfig, StateControllerConfig, SwitchStateControllerConfig, VmaasConfig,
-    VpcPeeringPolicy, default_max_find_by_ids,
+    PowerShelfStateControllerConfig, RackStateControllerConfig, SiteExplorerConfig,
+    SiteExplorerExploreMode, SpdmConfig, SpdmStateControllerConfig, StateControllerConfig,
+    SwitchStateControllerConfig, VmaasConfig, VpcPeeringPolicy, default_max_find_by_ids,
 };
 use crate::ethernet_virtualization::{EthVirtData, SiteFabricPrefixList};
 use crate::ib::{self, IBFabricManagerImpl, IBFabricManagerType};
@@ -94,6 +95,7 @@ use crate::ib_fabric_monitor::IbFabricMonitor;
 use crate::ipmitool::IPMIToolTestImpl;
 use crate::logging::level_filter::ActiveLevel;
 use crate::logging::log_limiter::LogLimiter;
+use crate::nv_redfish::NvRedfishClientPool;
 use crate::nvl_partition_monitor::NvlPartitionMonitor;
 use crate::nvlink::NmxmClientPool;
 use crate::nvlink::test_support::NmxmSimClient;
@@ -1384,12 +1386,15 @@ pub async fn create_test_env_with_overrides(
     };
 
     let ipmi_tool = Arc::new(IPMIToolTestImpl {});
-
+    let bmc_proxy = Arc::new(ArcSwap::new(None.into()));
     let bmc_explorer = Arc::new(BmcEndpointExplorer::new(
         redfish_sim.clone(),
+        // TODO: need mock to switch to NvRedfishMode below...
+        Arc::new(NvRedfishClientPool::new(bmc_proxy)),
         ipmi_tool.clone(),
         credential_provider.clone(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        SiteExplorerExploreMode::LibRedfish,
     ));
 
     let reachability_params = ReachabilityParams {
@@ -1584,6 +1589,7 @@ pub async fn create_test_env_with_overrides(
             switches_created_per_run: 1,
             rotate_switch_nvos_credentials: Arc::new(false.into()),
             use_onboard_nic: Arc::new(false.into()),
+            explore_mode: SiteExplorerExploreMode::LibRedfish,
         },
         test_meter.meter(),
         Arc::new(fake_endpoint_explorer.clone()),
