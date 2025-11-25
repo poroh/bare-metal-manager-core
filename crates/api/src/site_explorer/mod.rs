@@ -63,6 +63,7 @@ use crate::cfg::file::{FirmwareConfig, SiteExplorerConfig};
 use crate::{CarbideError, CarbideResult};
 
 mod endpoint_explorer;
+mod nv_redfish_explore;
 pub use endpoint_explorer::EndpointExplorer;
 mod credentials;
 mod metrics;

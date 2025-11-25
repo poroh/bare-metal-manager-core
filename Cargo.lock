@@ -1356,6 +1356,7 @@ dependencies = [
  "nras",
  "num-bigint-dig",
  "num_cpus",
+ "nv-redfish",
  "oauth2",
  "oid-registry",
  "once_cell",

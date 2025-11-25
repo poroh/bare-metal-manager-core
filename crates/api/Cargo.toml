@@ -99,6 +99,16 @@ mac_address = { workspace = true }
 md5 = { workspace = true }
 num-bigint-dig = { workspace = true }
 num_cpus = { workspace = true }
+nv-redfish = { workspace = true, features = [
+    "std-redfish",
+    "oem-nvidia-bluefield",
+    "oem-nvidia-baseboard",
+    "oem-dell-attributes",
+    "oem-lenovo",
+    "oem-supermicro",
+    "oem-hpe",
+    "bmc-http"
+] }
 oauth2 = { default-features = false, workspace = true }
 oid-registry = { workspace = true }
 opentelemetry = { workspace = true, features = ["logs"] }
