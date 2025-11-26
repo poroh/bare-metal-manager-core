@@ -969,6 +969,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmc-explorer-cli"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "carbide-api",
+ "carbide-secrets",
+ "clap",
+ "libredfish",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bmc-mock"
 version = "0.1.0"
 dependencies = [

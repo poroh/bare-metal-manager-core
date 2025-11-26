@@ -80,10 +80,15 @@ mod web;
 // Allow carbide_macros::sqlx_test to be referred as #[crate::sqlx_test]
 #[cfg(test)]
 pub(crate) use carbide_macros::sqlx_test;
+pub use cfg::file::SiteExplorerExploreMode;
 // TODO: temporary while migrating db to its own crate
 pub use db::{DatabaseError, DatabaseResult};
 // Save typing
 pub(crate) use errors::{CarbideError, CarbideResult};
+pub use ipmitool::IPMIToolTestImpl;
+pub use nv_redfish::NvRedfishClientPool;
+pub use redfish::RedfishClientPoolImpl;
+pub use site_explorer::BmcEndpointExplorer;
 
 // Stuff needed by main.rs and api-test
 pub use crate::{cfg::command_line::Command, cfg::command_line::Options, run::run};
