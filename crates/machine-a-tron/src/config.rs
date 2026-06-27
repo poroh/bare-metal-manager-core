@@ -149,28 +149,32 @@ impl DpuFirmwareVersions {
     pub fn fill_missing_from_desired_firmware(
         self,
         desired_firmware: &[DesiredFirmwareVersionEntry],
+        hw_type: HostHardwareType,
     ) -> Self {
-        // We emulate bf3 DPU's, find those from the desired firmware.
-        let Some(bf3_firmware_map) = desired_firmware
+        let desired_model = match hw_type {
+            HostHardwareType::DellPowerEdgeR760Bf4 => "bluefield 4",
+            _ => "bluefield 3",
+        };
+        let Some(firmware_map) = desired_firmware
             .iter()
             .find(|entry| {
                 if entry.vendor != "nvidia" {
                     return false;
                 }
                 let normalized = entry.model.as_str().to_lowercase().replace("-", " ");
-                normalized.contains("bluefield 3")
+                normalized.contains(desired_model)
             })
             .map(|entry| &entry.component_versions)
         else {
             return self;
         };
 
-        // Prefer onese we already have set, falling back on the server-wanted ones.
+        // Prefer ones we already have set, falling back on the server-wanted ones.
         Self {
-            bmc: self.bmc.or_else(|| bf3_firmware_map.get("bmc").cloned()),
-            cec: self.cec.or_else(|| bf3_firmware_map.get("cec").cloned()),
-            uefi: self.uefi.or_else(|| bf3_firmware_map.get("uefi").cloned()),
-            nic: self.nic.or_else(|| bf3_firmware_map.get("nic").cloned()),
+            bmc: self.bmc.or_else(|| firmware_map.get("bmc").cloned()),
+            cec: self.cec.or_else(|| firmware_map.get("cec").cloned()),
+            uefi: self.uefi.or_else(|| firmware_map.get("uefi").cloned()),
+            nic: self.nic.or_else(|| firmware_map.get("nic").cloned()),
         }
     }
 }
@@ -543,5 +547,46 @@ scout_run_interval = "5s"
         let round_tripped = toml::from_str::<MachineATronConfig>(&serialized)
             .expect("Could not deserialize serialized config");
         assert_eq!(round_tripped, cfg);
+    }
+
+    #[test]
+    fn fills_firmware_from_the_emulated_dpu_model() {
+        let desired = [
+            DesiredFirmwareVersionEntry {
+                vendor: "nvidia".into(),
+                model: "BlueField-3 DPU".into(),
+                component_versions: HashMap::from([("bmc".into(), "bf3-bmc".into())]),
+            },
+            DesiredFirmwareVersionEntry {
+                vendor: "nvidia".into(),
+                model: "BlueField-4 B4240".into(),
+                component_versions: HashMap::from([
+                    ("bmc".into(), "bf4-bmc".into()),
+                    ("cec".into(), "bf4-cec".into()),
+                    ("uefi".into(), "bf4-uefi".into()),
+                    ("nic".into(), "bf4-nic".into()),
+                ]),
+            },
+        ];
+
+        let bf3 = DpuFirmwareVersions::default().fill_missing_from_desired_firmware(
+            &desired,
+            HostHardwareType::DellPowerEdgeR750,
+        );
+        assert_eq!(bf3.bmc.as_deref(), Some("bf3-bmc"));
+
+        let bf4 = DpuFirmwareVersions::default().fill_missing_from_desired_firmware(
+            &desired,
+            HostHardwareType::DellPowerEdgeR760Bf4,
+        );
+        assert_eq!(
+            bf4,
+            DpuFirmwareVersions {
+                bmc: Some("bf4-bmc".into()),
+                cec: Some("bf4-cec".into()),
+                uefi: Some("bf4-uefi".into()),
+                nic: Some("bf4-nic".into()),
+            }
+        );
     }
 }

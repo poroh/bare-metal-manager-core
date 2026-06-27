@@ -317,6 +317,15 @@ mod tests {
             mac
         );
     }
+
+    #[test]
+    fn identifies_bluefield_models() {
+        assert_eq!(DpuModel::from("BlueField-2 DPU"), DpuModel::BlueField2);
+        assert_eq!(DpuModel::from("BlueField-3 DPU"), DpuModel::BlueField3);
+        assert_eq!(DpuModel::from("NVIDIA BlueField-4 B4240"), DpuModel::BlueField4);
+        assert_eq!(DpuModel::from("B4240"), DpuModel::BlueField4);
+        assert_eq!(DpuModel::from("other"), DpuModel::Unknown);
+    }
 }
 
 /// DPU related config.
@@ -324,6 +333,7 @@ mod tests {
 pub enum DpuModel {
     BlueField2,
     BlueField3,
+    BlueField4,
     Unknown,
 }
 
@@ -335,6 +345,9 @@ where
         match model.as_ref().to_lowercase().replace("-", " ") {
             value if value.contains("bluefield 2") => DpuModel::BlueField2,
             value if value.contains("bluefield 3") => DpuModel::BlueField3,
+            value if value.contains("bluefield 4") || value.contains("b4240") => {
+                DpuModel::BlueField4
+            }
             _ => DpuModel::Unknown,
         }
     }

@@ -886,11 +886,7 @@ impl EndpointExplorationReport {
             .and_then(|value| value.model.as_ref())
             .unwrap_or(&"".to_string())
             .to_string();
-        match model.to_lowercase() {
-            value if value.contains("bluefield 2") => Some(DpuModel::BlueField2),
-            value if value.contains("bluefield 3") => Some(DpuModel::BlueField3),
-            _ => Some(DpuModel::Unknown),
-        }
+        Some(DpuModel::from(model))
     }
 
     pub fn create_temporary_dmi_data(

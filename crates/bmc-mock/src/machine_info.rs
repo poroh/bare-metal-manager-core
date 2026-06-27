@@ -150,10 +150,17 @@ impl DpuMachineInfo {
     }
 
     fn bluefield4(&self) -> hw::bluefield4::Bluefield4<'_> {
+        let firmware_versions = &self.settings.firmware_versions;
         hw::bluefield4::Bluefield4 {
             host_mac_address: self.host_mac_address,
             bmc_mac_address: self.bmc_mac_address,
             product_serial_number: Cow::Borrowed(&self.serial),
+            firmware_versions: hw::bluefield4::FirmwareVersions {
+                bmc: firmware_versions.bmc.clone().unwrap_or_default(),
+                uefi: firmware_versions.uefi.clone().unwrap_or_default(),
+                erot: firmware_versions.cec.clone().unwrap_or_default(),
+                dpu_nic: firmware_versions.nic.clone().unwrap_or_default(),
+            },
         }
     }
 

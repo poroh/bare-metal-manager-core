@@ -39,6 +39,15 @@ pub const BF3_CEC_VERSION: &str = "00.02.0195.0000_n02";
 /// Default BlueField-3 UEFI firmware version.
 pub const BF3_UEFI_VERSION: &str = "4.13.2-12-g943a91640d";
 
+/// Default BlueField-4 NIC firmware version.
+pub const BF4_NIC_VERSION: &str = "82.48.0802";
+
+/// Default BlueField-4 BMC firmware version.
+pub const BF4_BMC_VERSION: &str = "BF4-26.01-2";
+
+/// Default BlueField-4 CEC firmware version.
+pub const BF4_CEC_VERSION: &str = "02.00.0016.0000_n05";
+
 #[cfg(test)]
 mod tests {
     use carbide_test_support::value_scenarios;
@@ -55,6 +64,9 @@ mod tests {
         Bf3Bmc,
         Bf3Cec,
         Bf3Uefi,
+        Bf4Nic,
+        Bf4Bmc,
+        Bf4Cec,
     }
 
     fn default_version(version: BlueFieldVersion) -> &'static str {
@@ -67,6 +79,9 @@ mod tests {
             BlueFieldVersion::Bf3Bmc => BF3_BMC_VERSION,
             BlueFieldVersion::Bf3Cec => BF3_CEC_VERSION,
             BlueFieldVersion::Bf3Uefi => BF3_UEFI_VERSION,
+            BlueFieldVersion::Bf4Nic => BF4_NIC_VERSION,
+            BlueFieldVersion::Bf4Bmc => BF4_BMC_VERSION,
+            BlueFieldVersion::Bf4Cec => BF4_CEC_VERSION,
         }
     }
 
@@ -86,6 +101,12 @@ mod tests {
                 BlueFieldVersion::Bf3Bmc => "BF-25.10-20",
                 BlueFieldVersion::Bf3Cec => "00.02.0195.0000_n02",
                 BlueFieldVersion::Bf3Uefi => "4.13.2-12-g943a91640d",
+            }
+
+            "bluefield 4" {
+                BlueFieldVersion::Bf4Nic => "82.48.0802",
+                BlueFieldVersion::Bf4Bmc => "BF4-26.01-2",
+                BlueFieldVersion::Bf4Cec => "02.00.0016.0000_n05",
             }
         );
     }

@@ -26,7 +26,8 @@ use carbide_dpf::types::DpfProxyDetails;
 use carbide_firmware::FirmwareConfig;
 use carbide_firmware::defaults::{
     BF2_BMC_VERSION, BF2_CEC_VERSION, BF2_NIC_VERSION, BF2_UEFI_VERSION, BF3_BMC_VERSION,
-    BF3_CEC_VERSION, BF3_NIC_VERSION, BF3_UEFI_VERSION,
+    BF3_CEC_VERSION, BF3_NIC_VERSION, BF3_UEFI_VERSION, BF4_BMC_VERSION, BF4_CEC_VERSION,
+    BF4_NIC_VERSION,
 };
 use carbide_ib_fabric::config::{IBFabricConfig, IbFabricDefinition};
 use carbide_machine_controller::config::power_manager::default_power_options;
@@ -1891,6 +1892,13 @@ impl DpuConfig {
                 .and_then(|fc| fc.known_firmware.first())
         })
     }
+    pub fn find_bf4_entry(&self) -> Option<&FirmwareEntry> {
+        self.dpu_models.get("bluefield4").and_then(|f| {
+            f.components
+                .get(&FirmwareComponentType::Bmc)
+                .and_then(|fc| fc.known_firmware.first())
+        })
+    }
 }
 
 impl<'de> Deserialize<'de> for DpuConfig {
@@ -2058,10 +2066,52 @@ impl Default for DpuConfig {
                         ]),
                     },
                 ),
+                (
+                    "bluefield4".to_string(),
+                    Firmware {
+                        vendor: BMCVendor::Nvidia,
+                        model: "BlueField-4 B4240".to_string(),
+                        ordering: vec![FirmwareComponentType::Bmc, FirmwareComponentType::Cec],
+                        explicit_start_needed: false,
+                        components: HashMap::from([
+                            (
+                                FirmwareComponentType::Bmc,
+                                FirmwareComponent {
+                                    current_version_reported_as: Some(
+                                        Regex::new("^BMC_Firmware$").unwrap(),
+                                    ),
+                                    preingest_upgrade_when_below: None,
+                                    known_firmware: vec![FirmwareEntry::standard(BF4_BMC_VERSION)],
+                                },
+                            ),
+                            (
+                                FirmwareComponentType::Cec,
+                                FirmwareComponent {
+                                    current_version_reported_as: Some(
+                                        Regex::new("^Bluefield_(BMC|CPU)_ERoT_FW$").unwrap(),
+                                    ),
+                                    preingest_upgrade_when_below: None,
+                                    known_firmware: vec![FirmwareEntry::standard(BF4_CEC_VERSION)],
+                                },
+                            ),
+                            (
+                                FirmwareComponentType::Nic,
+                                FirmwareComponent {
+                                    current_version_reported_as: Some(
+                                        Regex::new("^Bluefield_NIC_FW$").unwrap(),
+                                    ),
+                                    preingest_upgrade_when_below: None,
+                                    known_firmware: vec![FirmwareEntry::standard(BF4_NIC_VERSION)],
+                                },
+                            ),
+                        ]),
+                    },
+                ),
             ]),
             dpu_nic_firmware_update_versions: vec![
                 BF2_NIC_VERSION.to_string(),
                 BF3_NIC_VERSION.to_string(),
+                BF4_NIC_VERSION.to_string(),
             ],
             dpu_enable_secure_boot: false,
             num_of_vfs: DEFAULT_DPU_NUM_OF_VFS,
@@ -2566,6 +2616,21 @@ mod tests {
     use crate::test_support::network_segment::FIXTURE_TENANT_ORG_ID;
 
     const TEST_DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/cfg/test_data");
+
+    #[test]
+    fn default_dpu_config_includes_bluefield4_firmware() {
+        let config = DpuConfig::default();
+        let bluefield4 = config.dpu_models.get("bluefield4").unwrap();
+
+        assert_eq!(
+            config.find_bf4_entry().map(|entry| entry.version.as_str()),
+            Some(BF4_BMC_VERSION)
+        );
+        assert!(bluefield4.matching_version_id("Bluefield_BMC_ERoT_FW", FirmwareComponentType::Cec));
+        assert!(bluefield4.matching_version_id("Bluefield_CPU_ERoT_FW", FirmwareComponentType::Cec));
+        assert!(bluefield4.matching_version_id("Bluefield_NIC_FW", FirmwareComponentType::Nic));
+        assert!(!bluefield4.components.contains_key(&FirmwareComponentType::Uefi));
+    }
 
     #[test]
     fn deserialize_serialize_machine_controller_config() {

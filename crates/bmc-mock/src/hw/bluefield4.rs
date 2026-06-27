@@ -29,6 +29,14 @@ pub struct Bluefield4<'a> {
     pub product_serial_number: Cow<'a, str>,
     pub host_mac_address: MacAddress,
     pub bmc_mac_address: MacAddress,
+    pub firmware_versions: FirmwareVersions,
+}
+
+pub struct FirmwareVersions {
+    pub bmc: String,
+    pub uefi: String,
+    pub dpu_nic: String,
+    pub erot: String,
 }
 
 impl Bluefield4<'_> {
@@ -154,8 +162,23 @@ impl Bluefield4<'_> {
     }
 
     pub fn update_service_config(&self) -> redfish::update_service::UpdateServiceConfig {
+        let fw = &self.firmware_versions;
+        let fw_inv_builder = |id: &str| {
+            redfish::software_inventory::builder(
+                &redfish::software_inventory::firmware_inventory_resource(id),
+            )
+        };
         redfish::update_service::UpdateServiceConfig {
-            firmware_inventory: vec![],
+            firmware_inventory: [
+                fw_inv_builder("BMC_Firmware").version(&fw.bmc),
+                fw_inv_builder("Bluefield_BMC_ERoT_FW").version(&fw.erot),
+                fw_inv_builder("Bluefield_CPU_ERoT_FW").version(&fw.erot),
+                fw_inv_builder("Bluefield_NIC_FW").version(&fw.dpu_nic),
+                fw_inv_builder("DPU_UEFI").version(&fw.uefi),
+            ]
+            .into_iter()
+            .map(|builder| builder.build())
+            .collect(),
         }
     }
 
@@ -167,7 +190,7 @@ impl Bluefield4<'_> {
             model: Some("B4240".into()),
             description: Some("CX9 Family [ConnectX-9]".into()),
             part_number: Some(self.part_number().into()),
-            firmware_version: Some("82.48.0802".into()),
+            firmware_version: Some(self.firmware_versions.dpu_nic.clone().into()),
             is_mat_dpu: true,
         }
     }
@@ -190,7 +213,9 @@ impl Bluefield4<'_> {
             dpu_info: Some(DpuData {
                 part_number: self.part_number().into(),
                 part_description: format!("NVIDIA BlueField-4 {}", self.part_number()),
+                product_version: self.firmware_versions.dpu_nic.clone(),
                 factory_mac_address: self.host_mac_address.to_string(),
+                firmware_version: self.firmware_versions.dpu_nic.clone(),
                 ..Default::default()
             }),
             ..Default::default()

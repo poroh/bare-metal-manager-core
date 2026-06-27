@@ -3479,7 +3479,7 @@ fn bmc_eth0_to_base_mac_offset(report: &EndpointExplorationReport) -> Option<u64
     match report.identify_dpu()? {
         DpuModel::BlueField3 => Some(BF3_ETH0_TO_BASE_MAC_OFFSET),
         // BlueField-2 is not supported by the BMC eth0 offset fallback.
-        DpuModel::BlueField2 | DpuModel::Unknown => None,
+        DpuModel::BlueField2 | DpuModel::BlueField4 | DpuModel::Unknown => None,
     }
 }
 

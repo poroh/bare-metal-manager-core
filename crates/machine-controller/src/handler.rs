@@ -57,7 +57,7 @@ use machine_validation::{handle_machine_validation_requested, handle_machine_val
 use measured_boot::records::MeasurementMachineState;
 use model::DpuModel;
 use model::dpa_interface::DpaInterfaceControllerState;
-use model::firmware::{Firmware, FirmwareComponentType, FirmwareEntry};
+use model::firmware::{Firmware, FirmwareComponent, FirmwareComponentType, FirmwareEntry};
 use model::instance::InstanceNetworkSyncStatus;
 use model::instance::config::network::{
     DeviceLocator, InstanceInterfaceConfig, InterfaceFunctionId, NetworkDetails,
@@ -3761,6 +3761,28 @@ pub async fn try_wait_for_dpu_discovery(
 /// Returns Option<StateHandlerOutcome>:
 ///     If Some(_) means at least one fw component is not updated.
 ///     If None: All fw components are updated.
+fn find_configured_firmware_inventories<'a>(
+    inventories: &'a [String],
+    firmware: &Firmware,
+    component: FirmwareComponentType,
+) -> Vec<&'a str> {
+    inventories
+        .iter()
+        .filter(|inventory| firmware.matching_version_id(inventory, component))
+        .map(String::as_str)
+        .collect()
+}
+
+fn configured_firmware_component(
+    firmware: &Firmware,
+    component: FirmwareComponentType,
+) -> Option<&FirmwareComponent> {
+    firmware
+        .components
+        .get(&component)
+        .filter(|configured| configured.current_version_reported_as.is_some())
+}
+
 async fn check_fw_component_version(
     ctx: &mut StateHandlerContext<'_, MachineStateHandlerContextObjects>,
     dpu_snapshot: &Machine,
@@ -3771,15 +3793,12 @@ async fn check_fw_component_version(
         .create_redfish_client_from_machine(dpu_snapshot)
         .await?;
 
-    let redfish_component_name_map = HashMap::from([
-        // Note: DPU uses different name for BMC Firmware as
-        // BF2: 6d53cf4d_BMC_Firmware
-        // BF3: BMC_Firmware
-        (FirmwareComponentType::Nic, "DPU_NIC"),
-        (FirmwareComponentType::Bmc, "BMC_Firmware"),
-        (FirmwareComponentType::Uefi, "DPU_UEFI"),
-        (FirmwareComponentType::Cec, "Bluefield_FW_ERoT"),
-    ]);
+    let model = identify_dpu(dpu_snapshot);
+    let firmware = hardware_models
+        .find(bmc_vendor::BMCVendor::Nvidia, &model.to_string())
+        .ok_or(StateHandlerError::FirmwareUpdateError(eyre!(
+            "No configured firmware found for DPU model {model}"
+        )))?;
     let inventories = redfish_client
         .get_software_inventories()
         .await
@@ -3790,122 +3809,125 @@ async fn check_fw_component_version(
         FirmwareComponentType::Cec,
         FirmwareComponentType::Nic,
     ] {
-        let component_name = redfish_component_name_map.get(&component).unwrap();
-        let inventory_id = inventories
+        let Some(configured_component) = configured_firmware_component(&firmware, component) else {
+            tracing::debug!(?component, model = %firmware.model, "Skipping unconfigured firmware component");
+            continue;
+        };
+        let component_name = configured_component
+            .current_version_reported_as
+            .as_ref()
+            .expect("configured component must have an inventory pattern")
+            .as_str();
+        let inventory_ids =
+            find_configured_firmware_inventories(&inventories, &firmware, component);
+        if inventory_ids.is_empty() {
+            return Err(StateHandlerError::FirmwareUpdateError(eyre!(
+                "No inventory found for {component:?} matching configured pattern {component_name:?}; inventory list: {inventories:#?}",
+            )));
+        }
+        let expected_version = configured_component
+            .known_firmware
             .iter()
-            .find(|i| i.contains(component_name))
-            .ok_or(StateHandlerError::FirmwareUpdateError(eyre!(
-                "No inventory found that matches redfish component name: {component_name}; inventory list: {inventories:#?}",
-            )))?;
-
-        let inventory = match redfish_client.get_firmware(inventory_id).await {
-            Ok(inventory) => inventory,
-            Err(e) => {
-                tracing::error!(machine_id=%dpu_snapshot.id, "redfish command get_firmware error {}", e.to_string());
-                return Err(redfish_error("get_firmware", e));
-            }
-        };
-
-        if inventory.version.is_none() {
-            let msg = format!("Unknown {component_name:?} version");
-            tracing::error!(machine_id=%dpu_snapshot.id, msg);
-            return Err(StateHandlerError::FirmwareUpdateError(eyre!(msg)));
-        };
-
-        let cur_version = inventory
-            .version
-            .unwrap_or("Unknown current installed BMC FW version".to_string());
-
-        let model = identify_dpu(dpu_snapshot);
-
-        let expected_version = hardware_models
-            .find(bmc_vendor::BMCVendor::Nvidia, &model.to_string())
-            .and_then(|fw| fw.components.get(&component).cloned())
-            .and_then(|fw_component| {
-                fw_component
-                    .known_firmware
-                    .iter()
-                    .rfind(|fw_entry| !fw_entry.preingestion_exclusive_config)
-                    .cloned()
-            })
-            .map(|f| f.version)
+            .rfind(|fw_entry| !fw_entry.preingestion_exclusive_config)
+            .map(|entry| entry.version.clone())
             .unwrap_or("Unknown current configured BMC FW version".to_string());
 
-        if cur_version != expected_version {
-            // CEC_MIN_RESET_VERSION="00.02.0180.0000"
-            if component == FirmwareComponentType::Cec
-                && version_compare::compare_to(&cur_version, "00.02.0180.0000", Cmp::Lt)
-                    .is_ok_and(|x| x)
-            {
-                // For this case need to run host power cycle
-                tracing::info!(
-                    machine_id=%dpu_snapshot.id,
-                    "Need to launch host power cycle to update CEC FW from {} to {}",
-                    cur_version,
-                    expected_version
-                );
-                return Ok(None);
+        for inventory_id in inventory_ids {
+            let inventory = match redfish_client.get_firmware(inventory_id).await {
+                Ok(inventory) => inventory,
+                Err(e) => {
+                    tracing::error!(machine_id=%dpu_snapshot.id, "redfish command get_firmware error {}", e.to_string());
+                    return Err(redfish_error("get_firmware", e));
+                }
+            };
+
+            if inventory.version.is_none() {
+                let msg = format!("Unknown {component_name:?} version");
+                tracing::error!(machine_id=%dpu_snapshot.id, msg);
+                return Err(StateHandlerError::FirmwareUpdateError(eyre!(msg)));
             }
 
-            tracing::warn!(
+            let cur_version = inventory
+                .version
+                .unwrap_or("Unknown current installed BMC FW version".to_string());
+
+            if cur_version != expected_version {
+                // CEC_MIN_RESET_VERSION="00.02.0180.0000"
+                if component == FirmwareComponentType::Cec
+                    && version_compare::compare_to(&cur_version, "00.02.0180.0000", Cmp::Lt)
+                        .is_ok_and(|x| x)
+                {
+                    // For this case need to run host power cycle
+                    tracing::info!(
+                        machine_id=%dpu_snapshot.id,
+                        "Need to launch host power cycle to update CEC FW from {} to {}",
+                        cur_version,
+                        expected_version
+                    );
+                    return Ok(None);
+                }
+
+                tracing::warn!(
+                    machine_id=%dpu_snapshot.id,
+                    "{:#?} FW didn't update succesfully. Expected version: {}, Current version: {}",
+                    component,
+                    expected_version,
+                    cur_version,
+                );
+
+                // Don't return Error. In case of the error, reboot time won't be updated in db.
+                // This will cause continuous reboot of machine after first failure_retry_time is
+                // passed.
+                return Ok(Some(StateHandlerOutcome::wait(format!(
+                    "{:#?} FW didn't update succesfully. Expected version: {}, Current version: {}",
+                    component, expected_version, cur_version,
+                ))));
+            }
+
+            tracing::info!(
                 machine_id=%dpu_snapshot.id,
-                "{:#?} FW didn't update succesfully. Expected version: {}, Current version: {}",
+                inventory_id,
+                "{:#?} FW updated succesfully to {}",
                 component,
                 expected_version,
-                cur_version,
             );
 
-            // Don't return Error. In case of the error, reboot time won't be updated in db.
-            // This will cause continuous reboot of machine after first failure_retry_time is
-            // passed.
-            return Ok(Some(StateHandlerOutcome::wait(format!(
-                "{:#?} FW didn't update succesfully. Expected version: {}, Current version: {}",
-                component, expected_version, cur_version,
-            ))));
-        }
+            // BMC FW version need to update in machine_topology->bmc_info
+            if component == FirmwareComponentType::Bmc
+                && dpu_snapshot
+                    .bmc_info
+                    .clone()
+                    .firmware_version
+                    .is_some_and(|v| v != cur_version)
+            {
+                let bios_version: String = redfish_client
+                    .get_firmware("DPU_UEFI")
+                    .await
+                    .inspect_err(|e| {
+                        tracing::error!("redfish command get_firmware error {}", e.to_string());
+                        tracing::error!(machine_id=%dpu_snapshot.id, "redfish command get_firmware error {}", e.to_string());
+                    })
+                    .ok()
+                    .and_then(|uefi| uefi.version)
+                    .unwrap_or_else(|| {
+                        dpu_snapshot
+                            .hardware_info
+                            .as_ref()
+                            .and_then(|h| h.dmi_data.as_ref())
+                            .map(|d| d.bios_version.clone())
+                            .unwrap_or_default()
+                    });
 
-        tracing::info!(
-            machine_id=%dpu_snapshot.id,
-            "{:#?} FW updated succesfully to {}",
-            component,
-            expected_version,
-        );
-
-        // BMC FW version need to update in machine_topology->bmc_info
-        if component == FirmwareComponentType::Bmc
-            && dpu_snapshot
-                .bmc_info
-                .clone()
-                .firmware_version
-                .is_some_and(|v| v != cur_version)
-        {
-            let bios_version: String = redfish_client
-                .get_firmware("DPU_UEFI")
-                .await
-                .inspect_err(|e| {
-                    tracing::error!("redfish command get_firmware error {}", e.to_string());
-                    tracing::error!(machine_id=%dpu_snapshot.id, "redfish command get_firmware error {}", e.to_string());
-                })
-                .ok()
-                .and_then(|uefi| uefi.version)
-                .unwrap_or_else(|| {
-                    dpu_snapshot
-                        .hardware_info
-                        .as_ref()
-                        .and_then(|h| h.dmi_data.as_ref())
-                        .map(|d| d.bios_version.clone())
-                        .unwrap_or_default()
-                });
-
-            ctx.pending_db_writes.push(
-                // This is safe to defer to pending_db_writes because the DPU snapshot already has
-                // the machine ID needed for the topology update.
-                MachineWriteOp::UpdateFirmwareVersionByMachineId {
-                    machine_id: dpu_snapshot.id,
-                    bmc_version: cur_version,
-                    bios_version,
-                },
-            );
+                ctx.pending_db_writes.push(
+                    // This is safe to defer to pending_db_writes because the DPU snapshot already has
+                    // the machine ID needed for the topology update.
+                    MachineWriteOp::UpdateFirmwareVersionByMachineId {
+                        machine_id: dpu_snapshot.id,
+                        bmc_version: cur_version,
+                        bios_version,
+                    },
+                );
+            }
         }
     }
 
@@ -11483,7 +11505,6 @@ async fn get_power_state(redfish_client: &dyn Redfish) -> Result<PowerState, Sta
 mod tests {
     use std::str::FromStr;
 
-    use model::firmware::FirmwareComponent;
     use model::site_explorer::{
         EndpointExplorationReport, EndpointType, Inventory, PreingestionState, Service,
     };
@@ -11514,6 +11535,36 @@ mod tests {
         let deadline = scout_firmware_upgrade_deadline(started_at, u32::MAX, u32::MAX, usize::MAX);
 
         assert_eq!(deadline, started_at + Duration::hours(5));
+    }
+
+    #[test]
+    fn finds_inventory_using_model_firmware_pattern() {
+        let component = FirmwareComponentType::Cec;
+        let firmware = Firmware {
+            components: HashMap::from([(
+                component,
+                FirmwareComponent {
+                    current_version_reported_as: Some(
+                        Regex::new("^Bluefield_(BMC|CPU)_ERoT_FW$").unwrap(),
+                    ),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let inventories = vec![
+            "DPU_NIC".to_string(),
+            "Bluefield_BMC_ERoT_FW".to_string(),
+            "Bluefield_CPU_ERoT_FW".to_string(),
+        ];
+
+        assert_eq!(
+            find_configured_firmware_inventories(&inventories, &firmware, component),
+            vec!["Bluefield_BMC_ERoT_FW", "Bluefield_CPU_ERoT_FW"]
+        );
+        assert!(
+            configured_firmware_component(&firmware, FirmwareComponentType::Uefi).is_none()
+        );
     }
 
     #[test]
