@@ -298,7 +298,8 @@ pub trait Callbacks: std::fmt::Debug + Send + Sync + 'static {
     ) -> impl Future<Output = Result<SystemStateData, CallbackError>> + Send;
 
     /// Applies a partial boot configuration to the owner's current state.
-    /// Fails if the system or its owner is unavailable.
+    /// Completes backend operations before committing the updated state.
+    /// On failure the previous state is retained.
     fn set_boot_config(
         &self,
         system_id: &str,
@@ -306,12 +307,15 @@ pub trait Callbacks: std::fmt::Debug + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), CallbackError>> + Send;
 
     /// Replaces media contents; fails if the owner or configured device is unavailable.
+    /// Completes backend operations before committing the updated state.
+    /// On failure the previous state is retained.
     fn set_virtual_media(
         &self,
         system_id: &str,
         desired: VirtualMediaState,
     ) -> impl Future<Output = Result<(), CallbackError>> + Send;
 
+    /// Notification only; fallible updates belong in the operation callbacks.
     fn state_refresh_indication(&self);
 }
 
