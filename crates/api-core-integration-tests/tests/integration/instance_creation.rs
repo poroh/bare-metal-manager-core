@@ -15,7 +15,10 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
+
 use carbide_api_core::test_support::default_config;
+use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::fixture_config::FixtureDefault as _;
 use carbide_uuid::machine::StableHostMachineId;
@@ -23,20 +26,50 @@ use model::test_support::ManagedHostConfig;
 use rpc::forge::InstanceConfig;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
+use super::instance_common::controller::{advance_instance_to_ready, instance_controller};
 use super::instance_common::{
-    InstanceEnv, default_os_config, default_tenant_config, find_instances_by_label,
-    single_interface_network_config,
+    create_boot_networks, create_ready_host, default_os_config, default_tenant_config,
+    find_instances_by_label, instance_resource_pools, single_interface_network_config,
+    tenant_segments,
 };
 
 #[sqlx_test]
 async fn test_allocate_instance_with_labels(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
 
-    let txn = env
-        .harness
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+
+    let txn = harness
         .api()
         .database_connection
         .begin()
@@ -60,12 +93,19 @@ async fn test_allocate_instance_with_labels(_: PgPoolOptions, options: PgConnect
     };
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_id)
         .metadata(instance_metadata.clone())
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
     // Test searching based on instance id.
     let mut instance_matched_by_id = tinstance.rpc_instance().await;
@@ -80,7 +120,7 @@ async fn test_allocate_instance_with_labels(_: PgPoolOptions, options: PgConnect
         Some(instance_metadata.clone())
     );
 
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     let fetched_instance = tinstance.db_instance(&mut txn).await;
     assert_eq!(fetched_instance.machine_id, mh.host.id);
 
@@ -99,7 +139,7 @@ async fn test_allocate_instance_with_labels(_: PgPoolOptions, options: PgConnect
     txn.rollback().await.unwrap();
 
     let mut instances = find_instances_by_label(
-        &env,
+        harness.api(),
         rpc::forge::Label {
             key: "key1".to_string(),
             value: None,
@@ -130,12 +170,40 @@ async fn test_allocate_instance_with_labels(_: PgPoolOptions, options: PgConnect
 #[sqlx_test]
 async fn test_instance_hostname_creation(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
 
-    let txn = env
-        .harness
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+
+    let txn = harness
         .api()
         .database_connection
         .begin()
@@ -146,15 +214,22 @@ async fn test_instance_hostname_creation(_: PgPoolOptions, options: PgConnectOpt
     let instance_hostname = "test-hostname";
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_id)
         .hostname(instance_hostname)
         .tenant_org("org-nebulon")
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
 
     let fetched_instance = tinstance.db_instance(&mut txn).await;
 
@@ -165,8 +240,7 @@ async fn test_instance_hostname_creation(_: PgPoolOptions, options: PgConnectOpt
     txn.rollback().await.unwrap();
 
     //Check for duplicate hostnames
-    let txn = env
-        .harness
+    let txn = harness
         .api()
         .database_connection
         .begin()
@@ -174,24 +248,65 @@ async fn test_instance_hostname_creation(_: PgPoolOptions, options: PgConnectOpt
         .expect("Unable to create transaction on database pool");
     txn.commit().await.unwrap();
 
-    let other_mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let other_mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
     let other_instance = other_mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_id)
         .hostname(instance_hostname)
         .tenant_org("org-nvidia") // different org, should fail on the same one
         .build()
         .await;
-    env.advance_instance_to_ready(&other_mh, &other_instance)
-        .await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &other_mh,
+        &other_instance,
+    )
+    .await;
 }
 
 #[sqlx_test]
 async fn test_instance_phone_home(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
     let mut os = default_os_config();
     os.phone_home_enabled = true;
@@ -208,11 +323,18 @@ async fn test_instance_phone_home(_: PgPoolOptions, options: PgConnectOptions) {
     };
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .config(instance_config)
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
     let instance = tinstance.rpc_instance().await;
 
@@ -238,7 +360,7 @@ async fn test_instance_phone_home(_: PgPoolOptions, options: PgConnectOptions) {
         carbide_authn::middleware::Principal::SpiffeMachineIdentifier(mh.host.id.to_string()),
     );
     phone_home_req.extensions_mut().insert(auth_context);
-    env.harness
+    harness
         .api()
         .update_instance_phone_home_last_contact(phone_home_req)
         .await
@@ -262,12 +384,49 @@ async fn test_instance_phone_home(_: PgPoolOptions, options: PgConnectOptions) {
 #[sqlx_test]
 async fn test_instance_dns_resolution(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
     let (segment_id_1, segment_id_2) = {
-        let ids = env.tenant_segments(2).await;
+        let ids = tenant_segments(
+            harness.api(),
+            &network_controller,
+            &boot.domain,
+            segment_id,
+            2,
+        )
+        .await;
         (ids[0], ids[1])
     };
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
     let network = rpc::InstanceNetworkConfig {
         interfaces: vec![
@@ -301,16 +460,22 @@ async fn test_instance_dns_resolution(_: PgPoolOptions, options: PgConnectOption
 
     // Create instance with hostname
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .network(network)
         .hostname("test-hostname")
         .tenant_org("nvidia-org")
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
-    let response = env
-        .harness
+    let response = harness
         .api()
         .get_managed_host_network_config(tonic::Request::new(
             rpc::forge::ManagedHostNetworkConfigRequest {
@@ -322,8 +487,7 @@ async fn test_instance_dns_resolution(_: PgPoolOptions, options: PgConnectOption
         .into_inner();
 
     //DNS record domain always uses IP Address (for now)
-    let dns_record = env
-        .harness
+    let dns_record = harness
         .api()
         .lookup_record(tonic::Request::new(
             rpc::protos::dns::DnsResourceRecordLookupRequest {
@@ -355,9 +519,38 @@ async fn test_instance_dns_resolution(_: PgPoolOptions, options: PgConnectOption
 #[sqlx_test]
 async fn test_instance_null_hostname(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
     //Create instance with no hostname set
     let mut tenant_config = default_tenant_config();
@@ -369,14 +562,20 @@ async fn test_instance_null_hostname(_: PgPoolOptions, options: PgConnectOptions
         .rpc();
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .config(instance_config)
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
-    let _response = env
-        .harness
+    let _response = harness
         .api()
         .get_managed_host_network_config(tonic::Request::new(
             rpc::forge::ManagedHostNetworkConfigRequest {
@@ -388,8 +587,7 @@ async fn test_instance_null_hostname(_: PgPoolOptions, options: PgConnectOptions
         .into_inner();
 
     //DNS record domain always uses dashed IP (for now)
-    let dns_record = env
-        .harness
+    let dns_record = harness
         .api()
         .lookup_record(tonic::Request::new(
             rpc::protos::dns::DnsResourceRecordLookupRequest {

@@ -15,7 +15,10 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
+
 use carbide_api_core::test_support::default_config;
+use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::fixture_config::FixtureDefault as _;
 use carbide_uuid::extension_service::ExtensionServiceId;
@@ -28,18 +31,50 @@ use model::instance::config::network::InstanceServiceInterfaceConfig;
 use model::test_support::ManagedHostConfig;
 use tonic::Request;
 
-use super::instance_common::{InstanceEnv, find_instances_by_label};
+use super::instance_common::controller::{advance_instance_to_ready, instance_controller};
+use super::instance_common::{
+    create_boot_networks, create_ready_host, find_instances_by_label, instance_resource_pools,
+};
 
 #[sqlx_test]
 async fn test_instance_search_based_on_labels(pool: sqlx::PgPool) {
-    let env = InstanceEnv::new(pool.clone(), default_config::get()).await;
-    let segment_id = env.segment_id;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool.clone())
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
     // Each search has one matching instance and two nonmatching instances.
     for i in [1, 4, 8] {
-        let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+        let mh = create_ready_host(
+            &harness,
+            &site_explorer,
+            &boot,
+            ManagedHostConfig::default(),
+        )
+        .await;
 
         let tinstance = mh
-            .instance_builder(&env.harness)
+            .instance_builder(&harness)
             .single_interface_network_config(segment_id)
             .metadata(rpc::forge::Metadata {
                 name: format!("instance_{i}{i}{i}").to_string(),
@@ -57,7 +92,14 @@ async fn test_instance_search_based_on_labels(pool: sqlx::PgPool) {
             })
             .build()
             .await;
-        env.advance_instance_to_ready(&mh, &tinstance).await;
+        advance_instance_to_ready(
+            &mut controller,
+            &harness,
+            &network_controller,
+            &mh,
+            &tinstance,
+        )
+        .await;
     }
 
     struct Case {
@@ -94,7 +136,9 @@ async fn test_instance_search_based_on_labels(pool: sqlx::PgPool) {
     ];
 
     for case in cases {
-        let instances = find_instances_by_label(&env, case.label).await.instances;
+        let instances = find_instances_by_label(harness.api(), case.label)
+            .await
+            .instances;
 
         assert_eq!(instances.len(), 1, "{}", case.scenario);
         assert_eq!(
@@ -111,19 +155,55 @@ async fn test_instance_search_based_on_labels(pool: sqlx::PgPool) {
 #[sqlx_test]
 async fn test_find_instances_reports_corrupt_service_interface_as_internal(pool: sqlx::PgPool) {
     // Create an ordinary instance so only the seeded service-interface record is invalid.
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
     let instance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_id)
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &instance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &instance,
+    )
+    .await;
 
     // Seed an active attachment whose service-interface record uses an unsupported ordinal.
     let attachment_id = uuid::Uuid::new_v4();
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     let stored_instance = instance.db_instance(&mut txn).await;
     let current_extension_services = stored_instance.config.extension_services.clone();
     let mut seeded_extension_services = current_extension_services.clone();
@@ -177,8 +257,7 @@ async fn test_find_instances_reports_corrupt_service_interface_as_internal(pool:
         .expect("commit corrupt service-interface record");
 
     // A valid request must attribute the response failure to server-owned state.
-    let error = env
-        .harness
+    let error = harness
         .api()
         .find_instances_by_ids(Request::new(rpc::forge::InstancesByIdsRequest {
             instance_ids: vec![instance.id],

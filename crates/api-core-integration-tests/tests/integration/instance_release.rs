@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use carbide_api_core::test_support::default_config;
+use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::fixture_config::FixtureDefault as _;
 use carbide_uuid::machine::StableHostMachineId;
@@ -28,14 +30,20 @@ use rpc::forge::{InstanceAllocationRequest, InstanceConfig, Issue, IssueCategory
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tonic::IntoRequest;
 
+use super::instance_common::controller::{advance_instance_to_ready, instance_controller};
 use super::instance_common::{
-    InstanceEnv, default_os_config, default_tenant_config, single_interface_network_config,
+    BootNetworks, create_boot_networks, create_ready_host, default_os_config,
+    default_tenant_config, instance_resource_pools, single_interface_network_config,
 };
 
-async fn create_release_host(env: &InstanceEnv) -> TestManagedHost {
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+async fn create_release_host(
+    harness: &TestHarness,
+    site_explorer: &TestSiteExplorer,
+    boot: &BootNetworks,
+) -> TestManagedHost {
+    let mh = create_ready_host(harness, site_explorer, boot, ManagedHostConfig::default()).await;
     // Release assertions count this healthy hardware report alongside issue and repair overrides.
-    env.harness
+    harness
         .api()
         .insert_machine_health_report(
             rpc::forge::InsertMachineHealthReportRequest {
@@ -62,12 +70,27 @@ async fn create_release_host(env: &InstanceEnv) -> TestManagedHost {
 #[sqlx_test]
 async fn test_instance_release_backward_compatibility(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let mh = create_release_host(&env).await;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+
+    let mh = create_release_host(&harness, &site_explorer, &boot).await;
 
     // Use the fixture's VPC segment for the test
-    let segment_id = env.segment_id;
-
     // Create instance configuration
     let config = InstanceConfig::builder()
         .tenant(default_tenant_config())
@@ -75,8 +98,7 @@ async fn test_instance_release_backward_compatibility(_: PgPoolOptions, options:
         .network(single_interface_network_config(segment_id));
 
     // Allocate an instance using correct API structure
-    let instance_result = env
-        .harness
+    let instance_result = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -104,8 +126,7 @@ async fn test_instance_release_backward_compatibility(_: PgPoolOptions, options:
     // server side automatically sets missing optional fields to None/default values.
     // Therefore, setting issue: None and is_repair_tenant: None here exactly replicates
     // the behavior of an older client calling this API.
-    let release_response = env
-        .harness
+    let release_response = harness
         .api()
         .release_instance(tonic::Request::new(InstanceReleaseRequest {
             id: Some(instance_id),
@@ -123,7 +144,7 @@ async fn test_instance_release_backward_compatibility(_: PgPoolOptions, options:
     // The host should transition properly after successful cleanup
     // Wait a moment for async cleanup to complete
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
 
     let host_machine = mh.host.db_machine(&mut txn).await;
 
@@ -174,7 +195,23 @@ async fn test_instance_release_backward_compatibility(_: PgPoolOptions, options:
 #[sqlx_test]
 async fn test_instance_release_repair_tenant(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
 
     // Test both repair tenant scenarios: true and false
     let test_scenarios = vec![
@@ -191,12 +228,10 @@ async fn test_instance_release_repair_tenant(_: PgPoolOptions, options: PgConnec
     ];
 
     // Share the environment's VPC segment across all test scenarios
-    let segment_id = env.segment_id;
-
     for (is_repair_tenant, test_name, description) in test_scenarios {
         println!("Testing repair tenant scenario: is_repair_tenant={is_repair_tenant}");
 
-        let mh = create_release_host(&env).await;
+        let mh = create_release_host(&harness, &site_explorer, &boot).await;
 
         // Create instance configuration
         let config = InstanceConfig::builder()
@@ -205,8 +240,7 @@ async fn test_instance_release_repair_tenant(_: PgPoolOptions, options: PgConnec
             .network(single_interface_network_config(segment_id));
 
         // Allocate an instance
-        let instance_result = env
-            .harness
+        let instance_result = harness
             .api()
             .allocate_instance(
                 InstanceAllocationRequest::builder(false)
@@ -226,8 +260,7 @@ async fn test_instance_release_repair_tenant(_: PgPoolOptions, options: PgConnec
         let instance_id = *instance.id.as_ref().expect("Instance ID should be present");
 
         // Test enhanced instance release with repair tenant flag
-        let release_response = env
-            .harness
+        let release_response = harness
             .api()
             .release_instance(tonic::Request::new(InstanceReleaseRequest {
                 id: Some(instance_id),
@@ -243,7 +276,7 @@ async fn test_instance_release_repair_tenant(_: PgPoolOptions, options: PgConnec
 
         // Verify repair tenant behavior
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut txn = env.harness.db_txn().await;
+        let mut txn = harness.db_txn().await;
 
         let host_machine = mh.host.db_machine(&mut txn).await;
 
@@ -290,10 +323,25 @@ async fn test_instance_release_repair_tenant(_: PgPoolOptions, options: PgConnec
 #[sqlx_test]
 async fn test_instance_release_combined_enhancements(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let mh = create_release_host(&env).await;
-    let segment_id = env.segment_id;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
 
+    let mh = create_release_host(&harness, &site_explorer, &boot).await;
     // Create instance configuration
     let config = InstanceConfig::builder()
         .tenant(default_tenant_config())
@@ -301,8 +349,7 @@ async fn test_instance_release_combined_enhancements(_: PgPoolOptions, options: 
         .network(single_interface_network_config(segment_id));
 
     // Allocate an instance
-    let instance_result = env
-        .harness
+    let instance_result = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -329,8 +376,7 @@ async fn test_instance_release_combined_enhancements(_: PgPoolOptions, options: 
         details: "Hardware component failure detected during repair operation. Requires immediate attention.".to_string(),
     };
 
-    let release_response = env
-        .harness
+    let release_response = harness
         .api()
         .release_instance(tonic::Request::new(InstanceReleaseRequest {
             id: Some(instance_id),
@@ -346,7 +392,7 @@ async fn test_instance_release_combined_enhancements(_: PgPoolOptions, options: 
 
     // Verify combined enhancement effects
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
 
     let host_machine = mh.host.db_machine(&mut txn).await;
 
@@ -388,19 +434,31 @@ async fn test_instance_release_auto_repair_enabled(_: PgPoolOptions, options: Pg
     let mut config = default_config::get();
     config.auto_machine_repair_plugin.enabled = true;
 
-    let env = InstanceEnv::new(pool, config).await;
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
 
-    let mh = create_release_host(&env).await;
-    let segment_id = env.segment_id;
-
+    let mh = create_release_host(&harness, &site_explorer, &boot).await;
     let config = InstanceConfig::builder()
         .tenant(default_tenant_config())
         .os(default_os_config())
         .network(single_interface_network_config(segment_id));
 
     // Allocate instance
-    let instance_result = env
-        .harness
+    let instance_result = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -420,8 +478,7 @@ async fn test_instance_release_auto_repair_enabled(_: PgPoolOptions, options: Pg
     let instance_id = allocation_inner.id.unwrap();
 
     // Release instance with issue reporting (non-repair tenant, auto-repair ENABLED)
-    let release_response = env
-        .harness
+    let release_response = harness
         .api()
         .release_instance(tonic::Request::new(InstanceReleaseRequest {
             id: Some(instance_id),
@@ -440,7 +497,7 @@ async fn test_instance_release_auto_repair_enabled(_: PgPoolOptions, options: Pg
 
     // Verify auto-repair enabled effects: BOTH TenantReportedIssue AND RequestRepair should be applied
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
 
     let host_machine = mh.host.db_machine(&mut txn).await;
 
@@ -505,9 +562,38 @@ async fn test_can_not_update_instance_config_after_deletion(
     options: PgConnectOptions,
 ) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
     let initial_os = rpc::forge::InstanceOperatingSystemConfig {
         phone_home_enabled: false,
@@ -527,11 +613,18 @@ async fn test_can_not_update_instance_config_after_deletion(
         .rpc();
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .config(config.clone())
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
     let instance = tinstance.rpc_instance().await;
     let metadata = instance.metadata.as_ref().unwrap().clone();
@@ -548,7 +641,7 @@ async fn test_can_not_update_instance_config_after_deletion(
         rpc::forge::TenantState::Ready
     );
 
-    env.harness
+    harness
         .api()
         .release_instance(tonic::Request::new(InstanceReleaseRequest {
             id: tinstance.id.into(),
@@ -574,8 +667,7 @@ async fn test_can_not_update_instance_config_after_deletion(
     let updated_os = initial_os.clone();
 
     // Perform an update using update_instance_operating_system
-    let err = env
-        .harness
+    let err = harness
         .api()
         .update_instance_operating_system(tonic::Request::new(
             rpc::forge::InstanceOperatingSystemUpdateRequest {
@@ -595,8 +687,7 @@ async fn test_can_not_update_instance_config_after_deletion(
     // Perform an update using update_instance_config
     let mut updated_config = config.clone();
     updated_config.os = Some(updated_os.clone());
-    let err = env
-        .harness
+    let err = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {

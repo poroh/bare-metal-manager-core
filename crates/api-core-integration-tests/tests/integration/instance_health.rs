@@ -16,28 +16,34 @@
  */
 
 use std::str::FromStr;
+use std::sync::Arc;
 
+use carbide_api_core::test_support::default_config;
 use carbide_test_harness::prelude::*;
+use carbide_test_harness::test_support::fixture_config::FixtureDefault as _;
 use carbide_uuid::instance::InstanceId;
 use carbide_uuid::machine::{MachineId, StableHostMachineId};
+use model::test_support::ManagedHostConfig;
 use rpc::InstanceReleaseRequest;
 use rpc::forge::{InstanceAllocationRequest, InstanceConfig};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tonic::IntoRequest;
 
 use super::instance_common::{
-    InstanceFixture, default_os_config, default_tenant_config, single_interface_network_config,
+    create_boot_networks, create_ready_host, default_os_config, default_tenant_config,
+    instance_resource_pools, single_interface_network_config,
 };
 
 async fn send_health_report_entry(
-    env: &TestHarness,
+    harness: &TestHarness,
     machine_id: &MachineId,
     entry: (
         health_report::HealthReport,
         health_report::HealthReportApplyMode,
     ),
 ) {
-    env.api()
+    harness
+        .api()
         .insert_machine_health_report(tonic::Request::new(
             rpc::forge::InsertMachineHealthReportRequest {
                 machine_id: Some(*machine_id),
@@ -51,8 +57,9 @@ async fn send_health_report_entry(
         .unwrap();
 }
 
-async fn remove_health_report_entry(env: &TestHarness, machine_id: &MachineId, source: String) {
-    env.api()
+async fn remove_health_report_entry(harness: &TestHarness, machine_id: &MachineId, source: String) {
+    harness
+        .api()
         .remove_machine_health_report(tonic::Request::new(
             rpc::forge::RemoveMachineHealthReportRequest {
                 machine_id: Some(*machine_id),
@@ -69,11 +76,31 @@ async fn test_cannot_create_instance_on_unhealthy_dpu(
     options: PgConnectOptions,
 ) -> eyre::Result<()> {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let InstanceFixture {
-        harness: env,
-        mh,
-        segment_id,
-    } = InstanceFixture::new(pool).await;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+
     let host_machine_id: StableHostMachineId = mh.host.id.try_into().unwrap();
 
     // Report an unhealthy DPU
@@ -100,12 +127,13 @@ async fn test_cannot_create_instance_on_unhealthy_dpu(
         })
         .build()
         .await;
-    env.api()
+    harness
+        .api()
         .record_dpu_network_status(status.into_request())
         .await
         .expect("DPU network status should be recorded");
 
-    let result = env
+    let result = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -143,11 +171,31 @@ async fn test_create_instance_with_allow_unhealthy_machine_true(
     options: PgConnectOptions,
 ) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let InstanceFixture {
-        harness: env,
-        mh,
-        segment_id,
-    } = InstanceFixture::new(pool).await;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+
     let host_machine_id: StableHostMachineId = mh.host.id.try_into().unwrap();
 
     // Report an unhealthy DPU
@@ -174,14 +222,15 @@ async fn test_create_instance_with_allow_unhealthy_machine_true(
         })
         .build()
         .await;
-    env.api()
+    harness
+        .api()
         .record_dpu_network_status(status.into_request())
         .await
         .expect("DPU network status should be recorded");
 
     let instance_id: InstanceId = uuid::Uuid::new_v4().into();
 
-    let instance = env
+    let instance = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(true)
@@ -206,7 +255,7 @@ async fn test_create_instance_with_allow_unhealthy_machine_true(
 
     assert_eq!(instance.id, Some(instance_id));
 
-    let instance = env
+    let instance = harness
         .api()
         .find_instances_by_ids(tonic::Request::new(rpc::forge::InstancesByIdsRequest {
             instance_ids: vec![instance_id],
@@ -226,18 +275,37 @@ async fn test_instance_release_rejected_when_aggregate_health_has_prevent_instan
     options: PgConnectOptions,
 ) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let InstanceFixture {
-        harness: env,
-        mh,
-        segment_id,
-    } = InstanceFixture::new(pool).await;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
     let config = InstanceConfig::builder()
         .tenant(default_tenant_config())
         .os(default_os_config())
         .network(single_interface_network_config(segment_id));
 
-    let instance_result = env
+    let instance_result = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -274,13 +342,13 @@ async fn test_instance_release_rejected_when_aggregate_health_has_prevent_instan
     };
 
     send_health_report_entry(
-        &env,
+        &harness,
         &mh.host.id.into(),
         (block_release, health_report::HealthReportApplyMode::Merge),
     )
     .await;
 
-    let err = env
+    let err = harness
         .api()
         .release_instance(tonic::Request::new(InstanceReleaseRequest {
             id: Some(instance_id),
@@ -301,13 +369,14 @@ async fn test_instance_release_rejected_when_aggregate_health_has_prevent_instan
     );
 
     remove_health_report_entry(
-        &env,
+        &harness,
         &mh.host.id.into(),
         "test-prevent-instance-deletion-override".to_string(),
     )
     .await;
 
-    env.api()
+    harness
+        .api()
         .release_instance(tonic::Request::new(InstanceReleaseRequest {
             id: Some(instance_id),
             issue: None,

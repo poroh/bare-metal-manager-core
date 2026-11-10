@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
+
 use carbide_api_core::cfg::file::VmaasConfig;
 use carbide_api_core::test_support::default_config;
 use carbide_api_core::test_support::network_segment::FIXTURE_TENANT_NETWORK_SEGMENT_GATEWAYS;
@@ -26,7 +28,8 @@ use rpc::forge::{InstanceAllocationRequest, InstanceConfig};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use super::instance_common::{
-    InstanceEnv, default_os_config, default_tenant_config, single_interface_network_config,
+    create_boot_networks, create_ready_host, create_ready_tenant_segment, default_os_config,
+    default_tenant_config, instance_resource_pools, single_interface_network_config,
     single_interface_network_config_with_vfs,
 };
 
@@ -40,17 +43,46 @@ async fn test_instance_with_vf_when_vf_disabled(_: PgPoolOptions, options: PgCon
         bridging: None,
     });
 
-    let env = InstanceEnv::new(pool, config).await;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let vpc_id = db::vpc::find_by_segment(&env.harness.api().database_connection, env.segment_id)
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let vpc_id = db::vpc::find_by_segment(&harness.api().database_connection, segment_id)
         .await
         .unwrap()
         .unwrap()
         .id;
     let segment_id = vec![
-        env.segment_id,
-        env.create_tenant_segment(vpc_id, FIXTURE_TENANT_NETWORK_SEGMENT_GATEWAYS[1], "TENANT")
-            .await,
+        segment_id,
+        create_ready_tenant_segment(
+            harness.api(),
+            &network_controller,
+            &boot.domain,
+            vpc_id,
+            FIXTURE_TENANT_NETWORK_SEGMENT_GATEWAYS[1],
+            "TENANT",
+        )
+        .await,
     ];
 
     // Create instance configuration
@@ -60,8 +92,7 @@ async fn test_instance_with_vf_when_vf_disabled(_: PgPoolOptions, options: PgCon
         .network(single_interface_network_config_with_vfs(segment_id));
 
     // Allocate an instance
-    let instance_result = env
-        .harness
+    let instance_result = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -89,10 +120,30 @@ async fn test_instance_without_vf_when_vf_disabled(_: PgPoolOptions, options: Pg
         bridging: None,
     });
 
-    let env = InstanceEnv::new(pool, config).await;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let segment_id = env.segment_id;
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
 
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
     // Create instance configuration
     let config = InstanceConfig::builder()
         .tenant(default_tenant_config())
@@ -100,8 +151,7 @@ async fn test_instance_without_vf_when_vf_disabled(_: PgPoolOptions, options: Pg
         .network(single_interface_network_config(segment_id));
 
     // Allocate an instance
-    let instance_result = env
-        .harness
+    let instance_result = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)

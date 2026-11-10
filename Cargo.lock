@@ -1411,7 +1411,6 @@ dependencies = [
  "carbide-instrument",
  "carbide-ipmi",
  "carbide-machine-controller",
- "carbide-nvlink-manager",
  "carbide-rack",
  "carbide-redfish",
  "carbide-rpc",

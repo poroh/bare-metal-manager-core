@@ -17,9 +17,11 @@
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use carbide_api_core::test_support::default_config;
 use carbide_api_core::test_support::network_segment::FIXTURE_TENANT_ORG_ID;
+use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::fixture_config::{
     FixtureDefault as _, ManagedHostConfigExt as _,
@@ -41,9 +43,11 @@ use rpc::forge::{InstanceAllocationRequest, InstanceConfig, VpcCreationRequest};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tonic::IntoRequest;
 
+use super::instance_common::controller::{advance_instance_to_ready, instance_controller};
 use super::instance_common::{
-    InstanceEnv, create_fixture_tenant, create_tenant_overlay_prefix_with_prefix,
-    default_os_config, default_tenant_config, fnn_config, host_id,
+    create_boot_networks, create_fixture_tenant, create_ready_host,
+    create_tenant_overlay_prefix_with_prefix, default_os_config, default_tenant_config, fnn_config,
+    host_id, instance_resource_pools, tenant_segments,
 };
 
 #[sqlx_test]
@@ -51,14 +55,51 @@ use super::instance_common::{
 #[allow(deprecated)]
 async fn test_instance_address_creation(_: PgPoolOptions, options: PgConnectOptions) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
     let (segment_id_1, segment_id_2) = {
-        let ids = env.tenant_segments(2).await;
+        let ids = tenant_segments(
+            harness.api(),
+            &network_controller,
+            &boot.domain,
+            segment_id,
+            2,
+        )
+        .await;
         (ids[0], ids[1])
     };
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     assert_eq!(
         db::instance_address::count_by_segment_id(&mut txn, &segment_id_1)
             .await
@@ -103,14 +144,17 @@ async fn test_instance_address_creation(_: PgPoolOptions, options: PgConnectOpti
         auto_config: None,
     };
 
-    let tinstance = mh
-        .instance_builder(&env.harness)
-        .network(network)
-        .build()
-        .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    let tinstance = mh.instance_builder(&harness).network(network).build().await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     assert_eq!(
         db::instance_address::count_by_segment_id(&mut txn, &segment_id_1)
             .await
@@ -159,8 +203,7 @@ async fn test_instance_address_creation(_: PgPoolOptions, options: PgConnectOpti
     txn.commit().await.unwrap();
 
     // The addresses should show up in the internal config - which is sent to the DPU
-    let network_config = env
-        .harness
+    let network_config = harness
         .api()
         .get_managed_host_network_config(tonic::Request::new(
             rpc::forge::ManagedHostNetworkConfigRequest {
@@ -214,17 +257,45 @@ async fn test_allocate_instance_with_old_network_segemnt(
     options: PgConnectOptions,
 ) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let vpc_id = db::vpc::find_by_segment(&env.harness.api().database_connection, segment_id)
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let vpc_id = db::vpc::find_by_segment(&harness.api().database_connection, segment_id)
         .await
         .unwrap()
         .unwrap()
         .id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
-    let txn = env
-        .harness
+    let txn = harness
         .api()
         .database_connection
         .begin()
@@ -249,12 +320,19 @@ async fn test_allocate_instance_with_old_network_segemnt(
     }
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .network(nw_config)
         .metadata(instance_metadata.clone())
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
     // Test searching based on instance id.
     let mut instance_matched_by_id = tinstance.rpc_instance().await;
@@ -269,7 +347,7 @@ async fn test_allocate_instance_with_old_network_segemnt(
         Some(instance_metadata.clone())
     );
 
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     let snapshot = mh.snapshot(&mut txn).await;
 
     let fetched_instance = snapshot.instance.unwrap();
@@ -300,19 +378,39 @@ async fn test_allocate_instance_with_multiple_fnn_vpc_prefixes(
     options: PgConnectOptions,
 ) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, fnn_config()).await;
-    let mh = env
-        .create_managed_host(ManagedHostConfig::default().with_dpu_count(2))
-        .await;
+    let config = fnn_config();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let _segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default().with_dpu_count(2),
+    )
+    .await;
 
     // Register the tenant required by both FNN VPCs used in this allocation scenario.
-    create_fixture_tenant(&env, FIXTURE_TENANT_ORG_ID)
+    create_fixture_tenant(harness.api(), FIXTURE_TENANT_ORG_ID)
         .await
         .unwrap();
 
     // Create two FNN VPCs and prefixes to exercise cross-VPC allocation.
-    let first_vpc = env
-        .harness
+    let first_vpc = harness
         .api()
         .create_vpc(
             VpcCreationRequest::builder(FIXTURE_TENANT_ORG_ID)
@@ -328,8 +426,7 @@ async fn test_allocate_instance_with_multiple_fnn_vpc_prefixes(
         .into_inner()
         .id
         .unwrap();
-    let second_vpc = env
-        .harness
+    let second_vpc = harness
         .api()
         .create_vpc(
             VpcCreationRequest::builder(FIXTURE_TENANT_ORG_ID)
@@ -346,14 +443,14 @@ async fn test_allocate_instance_with_multiple_fnn_vpc_prefixes(
         .id
         .unwrap();
     let first_prefix_id = create_tenant_overlay_prefix_with_prefix(
-        &env,
+        &harness.api().database_connection,
         first_vpc,
         "fnn vpc prefix 1",
         IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 5, 224), 27).unwrap()),
     )
     .await;
     let second_prefix_id = create_tenant_overlay_prefix_with_prefix(
-        &env,
+        &harness.api().database_connection,
         second_vpc,
         "fnn vpc prefix 2",
         IpNetwork::V4(Ipv4Network::new(Ipv4Addr::new(10, 217, 6, 224), 27).unwrap()),
@@ -361,8 +458,7 @@ async fn test_allocate_instance_with_multiple_fnn_vpc_prefixes(
     .await;
 
     // Allocate an instance whose interfaces draw from both VPC prefixes.
-    let instance = env
-        .harness
+    let instance = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -404,8 +500,7 @@ async fn test_allocate_instance_with_multiple_fnn_vpc_prefixes(
     );
 
     // Fetch through the API to verify the persisted config, not just the create response.
-    let mut persisted_instances = env
-        .harness
+    let mut persisted_instances = harness
         .api()
         .find_instances_by_ids(
             rpc::forge::InstancesByIdsRequest {
@@ -434,7 +529,7 @@ async fn test_allocate_instance_with_multiple_fnn_vpc_prefixes(
     assert_eq!(segment_ids.iter().copied().collect::<HashSet<_>>().len(), 2);
 
     // Verify the allocated segments are attached to both requested FNN VPCs.
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     let segments = db::network_segment::find_by(
         txn.as_mut(),
         ObjectColumnFilter::List(IdColumn, &segment_ids),

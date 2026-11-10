@@ -49,7 +49,6 @@ carbide-ib-fabric = { path = "../ib-fabric", features = ["test-support"] }
 carbide-instrument = { path = "../instrument", features = ["test-support"] }
 carbide-ipmi = { path = "../ipmi" }
 carbide-machine-controller = { path = "../machine-controller" }
-carbide-nvlink-manager = { path = "../nvlink-manager", features = ["test-support"] }
 carbide-rack = { path = "../rack" }
 carbide-redfish = { path = "../redfish", features = ["test-support"] }
 carbide-rpc = { path = "../rpc", features = ["model", "sqlx", "test-support"] }

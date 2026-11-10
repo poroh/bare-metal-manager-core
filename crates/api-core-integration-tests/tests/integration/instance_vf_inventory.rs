@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use carbide_api_core::test_support::default_config;
+use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::fixture_config::FixtureDefault as _;
 use itertools::Itertools;
@@ -29,9 +31,11 @@ use rpc::forge::{InstanceAllocationRequest, InstanceConfig};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tonic::Request;
 
+use super::instance_common::controller::{advance_instance_to_ready, instance_controller};
 use super::instance_common::{
-    InstanceEnv, default_os_config, default_tenant_config, host_id,
-    single_interface_network_config, single_interface_network_config_with_vfs,
+    BootNetworks, create_boot_networks, create_ready_host, default_os_config,
+    default_tenant_config, host_id, instance_resource_pools, single_interface_network_config,
+    single_interface_network_config_with_vfs, tenant_segments,
 };
 
 /// Verifies sparse DPF topology membership gates both allocation and network replacement.
@@ -42,21 +46,56 @@ async fn test_dpf_topology_rejects_unselected_vf_on_create_and_update(
 ) {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
     let config = carbide_api_core::test_support::default_config::with_dpf_intercept_topology(&[7]);
-    let env = InstanceEnv::new(pool, config).await;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let mut txn = env.harness.api().database_connection.begin().await.unwrap();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let mut txn = harness.api().database_connection.begin().await.unwrap();
     db::machine::mark_machine_ingestion_done_with_dpf(&mut txn, &host_id(&mh))
         .await
         .unwrap();
     txn.commit().await.unwrap();
-    let segment_ids = env.tenant_segments(2).await;
+    let segment_ids = tenant_segments(
+        harness.api(),
+        &network_controller,
+        &boot.domain,
+        segment_id,
+        2,
+    )
+    .await;
 
     // VF0 is structurally valid and globally enabled, but the replacement topology selects VF7.
     let mut network_with_unselected_vf =
         single_interface_network_config_with_vfs(segment_ids.clone());
     network_with_unselected_vf.interfaces[1].virtual_function_id = Some(0);
-    let create_error = env
-        .harness
+    let create_error = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -78,13 +117,19 @@ async fn test_dpf_topology_rejects_unselected_vf_on_create_and_update(
     // A PF-only instance remains valid; once ready, adding the same unselected VF must fail at
     // the network-update gate and leave no staged replacement request.
     let instance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_ids[0])
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &instance).await;
-    let update_error = env
-        .harness
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &instance,
+    )
+    .await;
+    let update_error = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -114,7 +159,7 @@ async fn test_dpf_topology_rejects_unselected_vf_on_create_and_update(
         "virtual function VF0 is not selected by the configured DPF intercept-bridging topology"
     ));
 
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     assert!(
         instance
             .db_instance(&mut txn)
@@ -142,16 +187,51 @@ async fn test_instance_vf_inventory_rejects_unavailable_vf_on_create_and_update(
         .as_mut()
         .expect("the DPF topology config includes VMaaS")
         .hbn_reps = Some("pf0hpf,pf0vf0-pf0vf13,pf1hpf".to_string());
-    let env = InstanceEnv::new(pool, config).await;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let segment_ids = env.tenant_segments(2).await;
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let segment_ids = tenant_segments(
+        harness.api(),
+        &network_controller,
+        &boot.domain,
+        segment_id,
+        2,
+    )
+    .await;
 
     // VF14 is supported by the hardware population but absent from the configured inventory.
     let mut network_with_unavailable_vf =
         single_interface_network_config_with_vfs(segment_ids.clone());
     network_with_unavailable_vf.interfaces[1].virtual_function_id = Some(14);
-    let create_error = env
-        .harness
+    let create_error = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -172,13 +252,19 @@ async fn test_instance_vf_inventory_rejects_unavailable_vf_on_create_and_update(
 
     // A PF-only instance remains valid; adding VF14 must fail without staging the replacement.
     let instance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_ids[0])
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &instance).await;
-    let update_error = env
-        .harness
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &instance,
+    )
+    .await;
+    let update_error = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -208,7 +294,7 @@ async fn test_instance_vf_inventory_rejects_unavailable_vf_on_create_and_update(
         "virtual function VF14 is not available in the configured instance VF inventory"
     ));
 
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     assert!(
         instance
             .db_instance(&mut txn)
@@ -233,10 +319,52 @@ async fn test_implicit_instance_vfs_follow_sparse_hbn_inventory_on_create_and_up
         .as_mut()
         .expect("the default test configuration includes VMaaS")
         .hbn_reps = Some("pf0hpf,pf0vf2,pf0vf5,pf1hpf".to_string());
-    let env = InstanceEnv::new(pool, config).await;
-    let create_mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let update_mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let segment_ids = env.tenant_segments(3).await;
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let create_mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let update_mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let segment_ids = tenant_segments(
+        harness.api(),
+        &network_controller,
+        &boot.domain,
+        segment_id,
+        3,
+    )
+    .await;
 
     let implicit_network = || {
         let mut network = single_interface_network_config_with_vfs(segment_ids.clone());
@@ -248,8 +376,7 @@ async fn test_implicit_instance_vfs_follow_sparse_hbn_inventory_on_create_and_up
         network
     };
 
-    let created_instance = env
-        .harness
+    let created_instance = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -282,13 +409,19 @@ async fn test_implicit_instance_vfs_follow_sparse_hbn_inventory_on_create_and_up
     assert_eq!(created_vfs, vec![2, 5]);
 
     let update_instance = update_mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_ids[0])
         .build()
         .await;
-    env.advance_instance_to_ready(&update_mh, &update_instance)
-        .await;
-    env.harness
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &update_mh,
+        &update_instance,
+    )
+    .await;
+    harness
         .api()
         .update_instance_config(Request::new(rpc::forge::InstanceConfigUpdateRequest {
             instance_id: update_instance.rpc_instance().await.id,
@@ -313,7 +446,7 @@ async fn test_implicit_instance_vfs_follow_sparse_hbn_inventory_on_create_and_up
         .await
         .expect("an update with implicit VFs must use the sparse inventory");
 
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     let staged_update = update_instance
         .db_instance(&mut txn)
         .await
@@ -348,9 +481,45 @@ async fn test_implicit_sparse_vf_noop_update_bypasses_overlap_lock(
         .as_mut()
         .expect("the default test configuration includes VMaaS")
         .hbn_reps = Some("pf0hpf,pf0vf2,pf0vf5,pf1hpf".to_string());
-    let env = InstanceEnv::new(pool, config).await;
-    let host = env.create_managed_host(ManagedHostConfig::default()).await;
-    let segment_ids = env.tenant_segments(3).await;
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let host = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let segment_ids = tenant_segments(
+        harness.api(),
+        &network_controller,
+        &boot.domain,
+        segment_id,
+        3,
+    )
+    .await;
     let implicit_network = || {
         let mut network = single_interface_network_config_with_vfs(segment_ids.clone());
         for interface in &mut network.interfaces {
@@ -363,7 +532,7 @@ async fn test_implicit_sparse_vf_noop_update_bypasses_overlap_lock(
 
     // Allocate the active instance through the legacy wire shape so it stores sparse VFs 2 and 5.
     let instance = host
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .config(
             InstanceConfig::builder()
                 .tenant(default_tenant_config())
@@ -373,7 +542,14 @@ async fn test_implicit_sparse_vf_noop_update_bypasses_overlap_lock(
         )
         .build()
         .await;
-    env.advance_instance_to_ready(&host, &instance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &host,
+        &instance,
+    )
+    .await;
 
     // Re-submit the full network without VF IDs while changing only metadata.
     let before = instance.rpc_instance().await;
@@ -398,13 +574,13 @@ async fn test_implicit_sparse_vf_noop_update_bypasses_overlap_lock(
     updated_metadata.description = "metadata-only sparse VF update".to_string();
 
     // Hold the expansion lock; the unchanged resolved network must complete without waiting on it.
-    let mut blocker = env.harness.db_txn().await;
+    let mut blocker = harness.db_txn().await;
     db::tenant_prefix_overlap::lock_checks(&mut blocker)
         .await
         .unwrap();
     let updated = tokio::time::timeout(
         Duration::from_secs(10),
-        env.harness.api().update_instance_config(Request::new(
+        harness.api().update_instance_config(Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
                 instance_id: before.id,
                 if_version_match: None,
@@ -421,7 +597,7 @@ async fn test_implicit_sparse_vf_noop_update_bypasses_overlap_lock(
 
     // Confirm only metadata changed and no network replacement was staged.
     assert_eq!(updated.metadata.as_ref(), Some(&updated_metadata));
-    let persisted = db::instance::find_by_id(&env.harness.api().database_connection, instance.id)
+    let persisted = db::instance::find_by_id(&harness.api().database_connection, instance.id)
         .await
         .unwrap()
         .expect("the instance remains persisted");
@@ -460,10 +636,33 @@ async fn test_bf4_cx9_topology_free_public_instance_paths_use_astra_static_inven
     config.dpf.enabled = true;
     config.dpu_config.num_of_vfs = 16;
     config.vmaas_config = None;
-    let env = InstanceEnv::new(pool, config).await;
-    let create_mh = create_bf4_astra_host(&env, 3).await;
-    let update_mh = create_bf4_astra_host(&env, 4).await;
-    let segment_ids = env.tenant_segments(2).await;
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+
+    let create_mh = create_bf4_astra_host(&harness, &site_explorer, &boot, 3).await;
+    let update_mh = create_bf4_astra_host(&harness, &site_explorer, &boot, 4).await;
+    let segment_ids = tenant_segments(
+        harness.api(),
+        &network_controller,
+        &boot.domain,
+        segment_id,
+        2,
+    )
+    .await;
 
     // Override only the VF ID: VF14 is valid for generic DPF but absent from Astra's static inventory.
     let vf14_network = || {
@@ -473,8 +672,7 @@ async fn test_bf4_cx9_topology_free_public_instance_paths_use_astra_static_inven
     };
 
     // The create path must select Astra and reject VF14 from its static VF0 through VF13 inventory.
-    let create_error = env
-        .harness
+    let create_error = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -491,8 +689,7 @@ async fn test_bf4_cx9_topology_free_public_instance_paths_use_astra_static_inven
         .expect_err("topology-free BF4 Astra creation must reject VF14");
 
     // Establish an assigned Ready instance so update exercises its independent host lookup.
-    let update_instance = env
-        .harness
+    let update_instance = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -512,7 +709,7 @@ async fn test_bf4_cx9_topology_free_public_instance_paths_use_astra_static_inven
         .id
         .expect("the allocated update fixture includes its ID");
     // Network updates require an assigned Ready host; DPF convergence is outside this contract.
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     db::machine::update_state(
         txn.as_mut(),
         &host_id(&update_mh),
@@ -525,8 +722,7 @@ async fn test_bf4_cx9_topology_free_public_instance_paths_use_astra_static_inven
     txn.commit().await.unwrap();
 
     // The update path must make the same Astra classification and reject the same VF.
-    let update_error = env
-        .harness
+    let update_error = harness
         .api()
         .update_instance_config(Request::new(rpc::forge::InstanceConfigUpdateRequest {
             instance_id: Some(update_instance_id),
@@ -575,10 +771,33 @@ async fn test_bf4_astra_implicit_instance_vfs_use_intercept_topology_on_create_a
     let mut config =
         carbide_api_core::test_support::default_config::with_dpf_intercept_topology(&[14]);
     config.dpu_config.num_of_vfs = 16;
-    let env = InstanceEnv::new(pool, config).await;
-    let create_mh = create_bf4_astra_host(&env, 1).await;
-    let update_mh = create_bf4_astra_host(&env, 2).await;
-    let segment_ids = env.tenant_segments(2).await;
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+
+    let create_mh = create_bf4_astra_host(&harness, &site_explorer, &boot, 1).await;
+    let update_mh = create_bf4_astra_host(&harness, &site_explorer, &boot, 2).await;
+    let segment_ids = tenant_segments(
+        harness.api(),
+        &network_controller,
+        &boot.domain,
+        segment_id,
+        2,
+    )
+    .await;
 
     // Clear the otherwise-complete fixture's VF identity so create and update must allocate from
     // the configured sparse topology while retaining the remaining network setup.
@@ -589,8 +808,7 @@ async fn test_bf4_astra_implicit_instance_vfs_use_intercept_topology_on_create_a
     };
 
     // Create an instance through the public API with an implicit VF identity.
-    let created_instance = env
-        .harness
+    let created_instance = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -632,8 +850,7 @@ async fn test_bf4_astra_implicit_instance_vfs_use_intercept_topology_on_create_a
     assert_eq!(created_vfs, vec![14]);
 
     // Re-read through the public API to prove the resolved topology identity was persisted.
-    let persisted_instances = env
-        .harness
+    let persisted_instances = harness
         .api()
         .find_instances_by_ids(Request::new(rpc::forge::InstancesByIdsRequest {
             instance_ids: vec![created_instance_id],
@@ -651,8 +868,7 @@ async fn test_bf4_astra_implicit_instance_vfs_use_intercept_topology_on_create_a
     );
 
     // Allocate directly because this test needs only an existing instance as the update baseline.
-    let update_instance = env
-        .harness
+    let update_instance = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -672,7 +888,7 @@ async fn test_bf4_astra_implicit_instance_vfs_use_intercept_topology_on_create_a
         .id
         .expect("the allocated update fixture includes its ID");
     // Network updates require an assigned Ready host; DPF convergence is outside this contract.
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     db::machine::update_state(
         txn.as_mut(),
         &host_id(&update_mh),
@@ -685,7 +901,7 @@ async fn test_bf4_astra_implicit_instance_vfs_use_intercept_topology_on_create_a
     txn.commit().await.unwrap();
 
     // Update through the public API with another implicit VF identity.
-    env.harness
+    harness
         .api()
         .update_instance_config(Request::new(rpc::forge::InstanceConfigUpdateRequest {
             instance_id: Some(update_instance_id),
@@ -711,7 +927,7 @@ async fn test_bf4_astra_implicit_instance_vfs_use_intercept_topology_on_create_a
         .expect("a BF4 Astra update must use the intercept topology");
 
     // Reload the staged replacement and verify persistence uses the same sparse VF identity.
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     let staged_update = db::instance::find_by_id(txn.as_mut(), update_instance_id)
         .await
         .unwrap()
@@ -742,24 +958,72 @@ async fn test_public_instance_endpoints_reject_out_of_range_wire_vfs(
     // both malformed values would pass exact topology membership after a lossy u32-to-u8 cast.
     let config =
         carbide_api_core::test_support::default_config::with_dpf_intercept_topology(&[0, 7, 15]);
-    let env = InstanceEnv::new(pool, config).await;
-    let create_mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let update_mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let mut txn = env.harness.api().database_connection.begin().await.unwrap();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let create_mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let update_mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let mut txn = harness.api().database_connection.begin().await.unwrap();
     for mh in [&create_mh, &update_mh] {
         db::machine::mark_machine_ingestion_done_with_dpf(&mut txn, &host_id(mh))
             .await
             .unwrap();
     }
     txn.commit().await.unwrap();
-    let segment_ids = env.tenant_segments(2).await;
+    let segment_ids = tenant_segments(
+        harness.api(),
+        &network_controller,
+        &boot.domain,
+        segment_id,
+        2,
+    )
+    .await;
     let update_instance = update_mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_ids[0])
         .build()
         .await;
-    env.advance_instance_to_ready(&update_mh, &update_instance)
-        .await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &update_mh,
+        &update_instance,
+    )
+    .await;
     let update_instance_id = update_instance.rpc_instance().await.id;
 
     // Build the protobuf directly so values wider than the model's u8 cannot be normalized by
@@ -786,8 +1050,7 @@ async fn test_public_instance_endpoints_reject_out_of_range_wire_vfs(
     };
 
     for wire_vf_id in [16, 256, 263] {
-        let create_error = env
-            .harness
+        let create_error = harness
             .api()
             .allocate_instance(Request::new(rpc::forge::InstanceAllocationRequest {
                 machine_id: Some(host_id(&create_mh)),
@@ -807,8 +1070,7 @@ async fn test_public_instance_endpoints_reject_out_of_range_wire_vfs(
                 .contains(&format!("virtual function ID of value {wire_vf_id}"))
         );
 
-        let update_error = env
-            .harness
+        let update_error = harness
             .api()
             .update_instance_config(Request::new(rpc::forge::InstanceConfigUpdateRequest {
                 instance_id: update_instance_id,
@@ -827,7 +1089,7 @@ async fn test_public_instance_endpoints_reject_out_of_range_wire_vfs(
     }
 
     // VF15 is the highest valid value and must pass the same public create and update paths.
-    env.harness
+    harness
         .api()
         .allocate_instance(Request::new(rpc::forge::InstanceAllocationRequest {
             machine_id: Some(host_id(&create_mh)),
@@ -840,7 +1102,7 @@ async fn test_public_instance_endpoints_reject_out_of_range_wire_vfs(
         }))
         .await
         .expect("VF15 must remain valid during instance creation");
-    env.harness
+    harness
         .api()
         .update_instance_config(Request::new(rpc::forge::InstanceConfigUpdateRequest {
             instance_id: update_instance_id,
@@ -853,19 +1115,28 @@ async fn test_public_instance_endpoints_reject_out_of_range_wire_vfs(
 }
 
 /// Builds a BF4/CX9 host through ordinary ingestion without creating Astra DPA rows.
-async fn create_bf4_astra_host(env: &InstanceEnv, cx9_mac_suffix: u8) -> TestManagedHost {
+async fn create_bf4_astra_host(
+    harness: &TestHarness,
+    site_explorer: &TestSiteExplorer,
+    boot: &BootNetworks,
+    cx9_mac_suffix: u8,
+) -> TestManagedHost {
     let config = ManagedHostConfig::default();
-    let host = env
-        .create_managed_host(ManagedHostConfig {
+    let host = create_ready_host(
+        harness,
+        site_explorer,
+        boot,
+        ManagedHostConfig {
             expected_machine_data: Some(ExpectedMachineData {
                 serial_number: config.serial.clone(),
                 dpf_enabled: Some(false),
                 ..Default::default()
             }),
             ..config
-        })
-        .await;
-    let mut txn = env.harness.db_txn().await;
+        },
+    )
+    .await;
+    let mut txn = harness.db_txn().await;
 
     // Mark the attached DPU as BF4, which combines with the CX9 declaration to select Astra.
     let dpu = host.first_dpu().db_machine(&mut txn).await;

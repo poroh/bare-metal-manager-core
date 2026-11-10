@@ -15,7 +15,10 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
+
 use carbide_api_core::test_support::default_config;
+use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_test_harness::prelude::*;
 use carbide_test_harness::test_support::fixture_config::FixtureDefault as _;
 use carbide_uuid::extension_service::ExtensionServiceId;
@@ -26,8 +29,10 @@ use rpc::forge::DpuExtensionService;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tonic::Request;
 
+use super::instance_common::controller::{advance_instance_to_ready, instance_controller};
 use super::instance_common::{
-    InstanceEnv, default_os_config, default_tenant_config, host_id, single_interface_network_config,
+    create_boot_networks, create_ready_host, default_os_config, default_tenant_config, host_id,
+    instance_resource_pools, single_interface_network_config,
 };
 
 /// Verifies allocation assigns and persists a non-nil UUIDv4 attachment ID so
@@ -39,12 +44,40 @@ async fn test_allocate_instance_with_extension_services(
     options: PgConnectOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
 
-    let _ = env
-        .harness
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+
+    let _ = harness
         .api()
         .create_tenant(tonic::Request::new(rpc::forge::CreateTenantRequest {
             organization_id: "best_org".to_string(),
@@ -60,8 +93,7 @@ async fn test_allocate_instance_with_extension_services(
 
     // Keep the service nonnetworked so allocation-time attachment identity is
     // the only new persisted behavior under test.
-    let service = env
-        .harness
+    let service = harness
         .api()
         .create_dpu_extension_service(tonic::Request::new(
             rpc::forge::CreateDpuExtensionServiceRequest {
@@ -105,14 +137,21 @@ async fn test_allocate_instance_with_extension_services(
     };
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .config(config.clone())
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
     // Reload persisted state to prove allocation assigned a durable, non-nil UUIDv4.
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     let snapshot = mh.snapshot(&mut txn).await;
     let instance_snapshot = snapshot.instance.unwrap();
 
@@ -153,17 +192,38 @@ async fn test_allocate_instance_with_extension_services_rejected_on_dpf_host(
     options: PgConnectOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let (service, _, _) = create_dpu_extension_services(&env).await?;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
 
-    let mut txn = env.harness.api().database_connection.begin().await?;
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let (service, _, _) = create_dpu_extension_services(&harness).await?;
+
+    let mut txn = harness.api().database_connection.begin().await?;
     db::machine::mark_machine_ingestion_done_with_dpf(&mut txn, &host_id(&mh)).await?;
     txn.commit().await?;
 
-    let result = env
-        .harness
+    let result = harness
         .api()
         .allocate_instance(Request::new(rpc::forge::InstanceAllocationRequest {
             machine_id: Some(host_id(&mh)),
@@ -215,15 +275,36 @@ async fn test_allocate_instance_with_duplicate_extension_services(
     options: PgConnectOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
     // Create extension services
-    let (service1, _, _) = create_dpu_extension_services(&env).await.unwrap();
+    let (service1, _, _) = create_dpu_extension_services(&harness).await.unwrap();
 
-    let instance = env
-        .harness
+    let instance = harness
         .api()
         .allocate_instance(tonic::Request::new(rpc::forge::InstanceAllocationRequest {
             machine_id: Some(host_id(&mh)),
@@ -291,12 +372,41 @@ async fn test_update_instance_with_extension_services(
     options: PgConnectOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
     // Create extension services
-    let (service1, service2, service3) = create_dpu_extension_services(&env).await.unwrap();
+    let (service1, service2, service3) = create_dpu_extension_services(&harness).await.unwrap();
 
     let service1_version2 = service1.active_versions[0].clone();
     let service1_version1 = service1.active_versions[1].clone();
@@ -337,11 +447,18 @@ async fn test_update_instance_with_extension_services(
     };
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .config(config.clone())
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
     let instance = tinstance.rpc_instance().await;
     assert!(
@@ -360,8 +477,7 @@ async fn test_update_instance_with_extension_services(
 
     // Submit both registered versions before any attachment terminates so lifecycle validation
     // cannot obscure the request-local duplicate-service invariant.
-    let duplicate_error = env
-        .harness
+    let duplicate_error = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -436,8 +552,7 @@ async fn test_update_instance_with_extension_services(
         }),
         power_profile: None,
     };
-    let instance = env
-        .harness
+    let instance = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -521,7 +636,7 @@ async fn test_update_instance_with_extension_services(
 
     // Record service2's attachment ID before removal so reattachment must revive it.
     let service2_attachment_id =
-        db::instance::find_by_id(&env.harness.api().database_connection, instance_id)
+        db::instance::find_by_id(&harness.api().database_connection, instance_id)
             .await?
             .expect("instance remains stored before extension-service removal")
             .config
@@ -546,8 +661,7 @@ async fn test_update_instance_with_extension_services(
         }),
         power_profile: None,
     };
-    let instance = env
-        .harness
+    let instance = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -614,7 +728,7 @@ async fn test_update_instance_with_extension_services(
 
     // Preserve the exact unrelated tombstones so reattachment cannot discard cleanup history.
     let terminating_attachments =
-        db::instance::find_by_id(&env.harness.api().database_connection, instance_id)
+        db::instance::find_by_id(&harness.api().database_connection, instance_id)
             .await?
             .expect("instance remains stored after extension-service removal")
             .config
@@ -624,8 +738,7 @@ async fn test_update_instance_with_extension_services(
 
     // Re-add an ordinary endpoint-free service at the same version while its retained attachment
     // is terminating to exercise the public asynchronous-removal contract.
-    let reattached = env
-        .harness
+    let reattached = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -689,7 +802,7 @@ async fn test_update_instance_with_extension_services(
         1
     );
     let persisted_attachments =
-        db::instance::find_by_id(&env.harness.api().database_connection, instance_id)
+        db::instance::find_by_id(&harness.api().database_connection, instance_id)
             .await?
             .expect("reattached instance remains stored")
             .config
@@ -732,8 +845,7 @@ async fn test_update_instance_with_extension_services(
         }),
         power_profile: None,
     };
-    let instance = env
-        .harness
+    let instance = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -755,8 +867,7 @@ async fn test_update_instance_with_extension_services(
     // Select an unknown registration so the API exposes entity absence distinctly from an invalid
     // version or a lifecycle precondition.
     let missing_service_id = ExtensionServiceId::new();
-    let missing_error = env
-        .harness
+    let missing_error = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -794,8 +905,7 @@ async fn test_update_instance_with_extension_services(
 
     // Create and delete an otherwise unused Pod registration so its durable row remains
     // distinguishable from an identifier that never existed.
-    let deleted_service = env
-        .harness
+    let deleted_service = harness
         .api()
         .create_dpu_extension_service(tonic::Request::new(
             rpc::forge::CreateDpuExtensionServiceRequest {
@@ -820,7 +930,7 @@ async fn test_update_instance_with_extension_services(
         .expect("created service has a version")
         .version
         .clone();
-    env.harness
+    harness
         .api()
         .delete_dpu_extension_service(Request::new(rpc::forge::DeleteDpuExtensionServiceRequest {
             service_id: deleted_service.service_id.clone(),
@@ -828,13 +938,12 @@ async fn test_update_instance_with_extension_services(
         }))
         .await?;
     let deletion_baseline =
-        db::instance::find_by_id(&env.harness.api().database_connection, instance_id)
+        db::instance::find_by_id(&harness.api().database_connection, instance_id)
             .await?
             .expect("instance remains stored before deleted-service rejection");
 
     // Selecting a known deleted registration is a failed lifecycle precondition, not entity absence.
-    let deleted_error = env
-        .harness
+    let deleted_error = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -870,7 +979,7 @@ async fn test_update_instance_with_extension_services(
 
     // A fresh read proves classification changed neither attachment configuration nor either
     // configuration version.
-    let persisted = db::instance::find_by_id(&env.harness.api().database_connection, instance_id)
+    let persisted = db::instance::find_by_id(&harness.api().database_connection, instance_id)
         .await?
         .expect("instance remains stored after deleted-service rejection");
     assert_eq!(
@@ -895,23 +1004,58 @@ async fn test_attach_extension_service_rejected_on_dpf_host(
     options: PgConnectOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
-    let (service, _, _) = create_dpu_extension_services(&env).await?;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
+    let (service, _, _) = create_dpu_extension_services(&harness).await?;
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .single_interface_network_config(segment_id)
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
-    let mut txn = env.harness.api().database_connection.begin().await?;
+    let mut txn = harness.api().database_connection.begin().await?;
     db::machine::mark_machine_ingestion_done_with_dpf(&mut txn, &host_id(&mh)).await?;
     txn.commit().await?;
 
-    let result = env
-        .harness
+    let result = harness
         .api()
         .update_instance_config(Request::new(rpc::forge::InstanceConfigUpdateRequest {
             instance_id: Some(tinstance.id),
@@ -960,12 +1104,41 @@ async fn test_extension_services_status_observation(
     options: PgConnectOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
-    let env = InstanceEnv::new(pool, default_config::get()).await;
-    let segment_id = env.segment_id;
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let config = default_config::get();
+    let redfish = Arc::new(RedfishSim::default());
+    let api_redfish = redfish.clone();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| {
+                builder
+                    .with_runtime_config(Arc::new(config))
+                    .with_redfish_pool(api_redfish)
+            })
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
+    let mut controller = instance_controller(&harness, &redfish);
+
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
 
     // Create an extension service
-    let (service1, _, _) = create_dpu_extension_services(&env).await.unwrap();
+    let (service1, _, _) = create_dpu_extension_services(&harness).await.unwrap();
     let versions = service1
         .active_versions
         .iter()
@@ -991,14 +1164,21 @@ async fn test_extension_services_status_observation(
     };
 
     let tinstance = mh
-        .instance_builder(&env.harness)
+        .instance_builder(&harness)
         .config(config.clone())
         .build()
         .await;
-    env.advance_instance_to_ready(&mh, &tinstance).await;
+    advance_instance_to_ready(
+        &mut controller,
+        &harness,
+        &network_controller,
+        &mh,
+        &tinstance,
+    )
+    .await;
 
     // Verify the status is correctly updated
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = harness.db_txn().await;
     let snapshot = mh.snapshot(&mut txn).await;
     let instance_snapshot = snapshot.instance.unwrap();
 
@@ -1076,7 +1256,7 @@ async fn test_extension_services_status_observation(
 }
 
 async fn create_dpu_extension_services(
-    env: &InstanceEnv,
+    harness: &TestHarness,
 ) -> Result<
     (
         DpuExtensionService,
@@ -1085,8 +1265,7 @@ async fn create_dpu_extension_services(
     ),
     Box<dyn std::error::Error>,
 > {
-    let _ = env
-        .harness
+    let _ = harness
         .api()
         .create_tenant(tonic::Request::new(rpc::forge::CreateTenantRequest {
             organization_id: "best_org".to_string(),
@@ -1100,8 +1279,7 @@ async fn create_dpu_extension_services(
         .await
         .unwrap();
 
-    let service1 = env
-        .harness
+    let service1 = harness
         .api()
         .create_dpu_extension_service(tonic::Request::new(
             rpc::forge::CreateDpuExtensionServiceRequest {
@@ -1122,8 +1300,7 @@ async fn create_dpu_extension_services(
         .into_inner();
 
     // Update the extension service with a new version
-    let service1 = env
-        .harness
+    let service1 = harness
         .api()
         .update_dpu_extension_service(tonic::Request::new(
             rpc::forge::UpdateDpuExtensionServiceRequest {
@@ -1140,8 +1317,7 @@ async fn create_dpu_extension_services(
         .await?
         .into_inner();
 
-    let service2 = env
-        .harness
+    let service2 = harness
         .api()
         .create_dpu_extension_service(tonic::Request::new(
             rpc::forge::CreateDpuExtensionServiceRequest {
@@ -1161,8 +1337,7 @@ async fn create_dpu_extension_services(
         .await?
         .into_inner();
 
-    let service3 = env
-        .harness
+    let service3 = harness
         .api()
         .create_dpu_extension_service(tonic::Request::new(
             rpc::forge::CreateDpuExtensionServiceRequest {

@@ -29,16 +29,33 @@ use model::test_support::ManagedHostConfig;
 use rpc::forge::{InstanceAllocationRequest, InstanceConfig};
 
 use super::instance_common::{
-    InstanceEnv, default_os_config, default_tenant_config, host_id, single_interface_network_config,
+    create_boot_networks, create_ready_host, default_os_config, default_tenant_config, host_id,
+    instance_resource_pools, single_interface_network_config,
 };
 
 #[sqlx_test]
 async fn test_allocate_and_update_with_network_security_group(
     pool: sqlx::PgPool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let env = InstanceEnv::new(pool, default_config::get()).await;
+    let config = default_config::get();
+    let pools = instance_resource_pools(config.fnn.is_some());
+    let harness = Box::pin(
+        TestHarness::builder(pool)
+            .with_resource_pools(pools)
+            .with_api_builder_fn(move |builder| builder.with_runtime_config(Arc::new(config)))
+            .build(),
+    )
+    .await;
+    let network_controller = harness.network_controller();
+    let boot = create_boot_networks(&harness, &network_controller).await;
+    let vpc_id = network_controller.create_vpc("test vpc 1").await;
+    let segment_id = network_controller
+        .create_tenant_segment(&boot.domain, vpc_id)
+        .await
+        .id;
+    let site_explorer = harness.default_test_site_explorer();
 
-    populate_network_security_groups(env.harness.api_arc()).await;
+    populate_network_security_groups(harness.api_arc()).await;
 
     // NSG ID of and NSG for the default tenant provided by fixtures.
     let good_network_security_group_id = "fd3ab096-d811-11ef-8fe9-7be4b2483448";
@@ -47,17 +64,20 @@ async fn test_allocate_and_update_with_network_security_group(
     let bad_network_security_group_id = "ddfcabc4-92dc-41e2-874e-2c7eeb9fa156";
 
     // Create a new managed host in the DB and get the snapshot.
-    let mh = env.create_managed_host(ManagedHostConfig::default()).await;
+    let mh = create_ready_host(
+        &harness,
+        &site_explorer,
+        &boot,
+        ManagedHostConfig::default(),
+    )
+    .await;
     let host_machine_id = host_id(&mh);
-
-    let segment_id = env.segment_id;
 
     // Try to create an instance, but send in a valid and
     // existing NSG ID that doesn't match the tenant of
     // instance being created.
     // This should fail.
-    let _ = env
-        .harness
+    let _ = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -82,8 +102,7 @@ async fn test_allocate_and_update_with_network_security_group(
 
     // Try that once more, but with an NSG ID
     // that has the same tenant as the instance.
-    let i = env
-        .harness
+    let i = harness
         .api()
         .allocate_instance(
             InstanceAllocationRequest::builder(false)
@@ -116,8 +135,7 @@ async fn test_allocate_and_update_with_network_security_group(
     let instance_id = i.id.unwrap();
 
     // Now update to remove the NSG attachment.
-    let i = env
-        .harness
+    let i = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -146,8 +164,7 @@ async fn test_allocate_and_update_with_network_security_group(
 
     // Now try to update it again and try to add the NSG with the mismatched tenant org
     // Now update to remove the NSG attachment.
-    let _ = env
-        .harness
+    let _ = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {
@@ -172,8 +189,7 @@ async fn test_allocate_and_update_with_network_security_group(
         .unwrap_err();
 
     // Now try to update it again and but with a good NSG
-    let i = env
-        .harness
+    let i = harness
         .api()
         .update_instance_config(tonic::Request::new(
             rpc::forge::InstanceConfigUpdateRequest {

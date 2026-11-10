@@ -20,16 +20,13 @@ use std::time::Duration;
 
 use carbide_credential_rotation::RotationGate;
 use carbide_health_metrics::PerObjectMetricsRegistry;
-use carbide_ib_fabric::IbFabricMonitor;
-use carbide_ib_fabric::ib::IBFabricManagerImpl;
 use carbide_machine_controller::context::MachineStateHandlerServices;
 use carbide_machine_controller::handler::{
     MachineStateHandlerBuilder, PowerOptionConfig, ReachabilityParams,
 };
 use carbide_machine_controller::io::MachineStateControllerIO;
-use carbide_nvlink_manager::NvlPartitionMonitor;
-use carbide_nvlink_manager::nvlink::test_support::NmxcSimClient;
 use carbide_redfish::libredfish::test_support::RedfishSim;
+use carbide_test_harness::network::controller::TestNetworkController;
 use carbide_test_harness::prelude::*;
 use futures_util::FutureExt as _;
 use health_report::HealthReport;
@@ -44,142 +41,81 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tonic::IntoRequest;
 
-pub(super) struct ControllerClients {
-    pub(super) redfish: Arc<RedfishSim>,
-    pub(super) ib: Arc<IBFabricManagerImpl>,
-    pub(super) nmxc: Arc<NmxcSimClient>,
-}
-
-pub(super) struct InstanceControllers {
-    machine: Mutex<StateController<MachineStateControllerIO>>,
-    ib: IbFabricMonitor,
-    nvl: Mutex<NvlPartitionMonitor>,
-    _cancel_token: CancellationToken,
-}
-
-impl InstanceControllers {
-    pub(super) fn new(harness: &TestHarness, clients: &ControllerClients) -> Self {
-        let cancel_token = CancellationToken::new();
-        let api = harness.api();
-        let config = &api.runtime_config;
-        Self {
-            machine: Mutex::new(machine_state_controller(
-                harness,
-                clients,
-                cancel_token.clone(),
-            )),
-            ib: IbFabricMonitor::new(
-                api.database_connection.clone(),
-                config.ib_fabrics.clone(),
-                harness.test_meter.meter(),
-                clients.ib.clone(),
-                config.host_health,
-                api.work_lock_manager_handle(),
-            ),
-            nvl: Mutex::new(NvlPartitionMonitor::new(
-                api.database_connection.clone(),
-                clients.nmxc.clone(),
-                harness.test_meter.meter(),
-                config
-                    .nvlink_config
-                    .clone()
-                    .expect("NVLink configuration should exist"),
-                config.host_health,
-                api.work_lock_manager_handle(),
-            )),
-            _cancel_token: cancel_token,
-        }
-    }
-
-    pub(super) async fn advance_instance_to_ready(
-        &self,
-        harness: &TestHarness,
-        mh: &TestManagedHost,
-        instance: &TestInstance,
-    ) {
-        harness.network_controller().run_single_iteration().await;
-        self.until(mh, 10, InstanceState::WaitingForNetworkConfig)
-            .await;
-        assert_eq!(
-            history(mh, 4).await,
-            vec![
-                assigned(InstanceState::DpaProvisioning),
-                assigned(InstanceState::WaitingForDpaToBeReady),
-                assigned(InstanceState::WaitingForNetworkSegmentToBeReady),
-                assigned(InstanceState::WaitingForNetworkConfig),
-            ]
-        );
-        for dpu in &mh.dpus {
-            let status = dpu.network_status().dpu_agent_version("test").build().await;
-            harness
-                .api()
-                .record_dpu_network_status(status.into_request())
-                .await
-                .unwrap();
-        }
-        self.machine
-            .lock()
-            .await
-            .run_single_iteration()
-            .boxed()
-            .await;
-        self.ib.run_single_iteration().boxed().await.unwrap();
-        self.ib.run_single_iteration().boxed().await.unwrap();
-        for _ in 0..3 {
-            self.nvl
-                .lock()
-                .await
-                .run_single_iteration()
-                .boxed()
-                .await
-                .unwrap();
-        }
+/// Drives the Ethernet instance provisioning sequence and checks its original transition history.
+/// The caller chooses when to construct and run the controller.
+pub(crate) async fn advance_instance_to_ready(
+    controller: &mut StateController<MachineStateControllerIO>,
+    harness: &TestHarness,
+    network_controller: &TestNetworkController,
+    mh: &TestManagedHost,
+    instance: &TestInstance,
+) {
+    network_controller.run_single_iteration().await;
+    until(controller, mh, 10, InstanceState::WaitingForNetworkConfig).await;
+    assert_eq!(
+        history(mh, 4).await,
+        vec![
+            assigned(InstanceState::DpaProvisioning),
+            assigned(InstanceState::WaitingForDpaToBeReady),
+            assigned(InstanceState::WaitingForNetworkSegmentToBeReady),
+            assigned(InstanceState::WaitingForNetworkConfig),
+        ]
+    );
+    for dpu in &mh.dpus {
+        let status = dpu.network_status().dpu_agent_version("test").build().await;
         harness
             .api()
-            .insert_machine_health_report(
-                rpc::forge::InsertMachineHealthReportRequest {
-                    machine_id: Some(mh.host.id.into()),
-                    health_report_entry: Some(rpc::forge::HealthReportEntry {
-                        report: Some(
-                            HealthReport::empty(format!("{HARDWARE_HEALTH_OVERRIDE_PREFIX}health"))
-                                .into(),
-                        ),
-                        ..Default::default()
-                    }),
-                }
-                .into_request(),
-            )
+            .record_dpu_network_status(status.into_request())
             .await
             .unwrap();
-        self.until(mh, 20, InstanceState::Ready).await;
-        assert_eq!(
-            history(mh, 2).await,
-            vec![
-                assigned(InstanceState::WaitingForRebootToReady),
-                assigned(InstanceState::Ready),
-            ]
-        );
-        instance.rpc_instance().await;
     }
+    controller.run_single_iteration().boxed().await;
 
-    async fn until(&self, mh: &TestManagedHost, max_iterations: u32, state: InstanceState) {
-        let expected = assigned(state);
-        for _ in 0..max_iterations {
-            self.machine
-                .lock()
-                .await
-                .run_single_iteration()
-                .boxed()
-                .await;
-            if mh.host.machine().await.current_state() == &expected {
-                return;
+    harness
+        .api()
+        .insert_machine_health_report(
+            rpc::forge::InsertMachineHealthReportRequest {
+                machine_id: Some(mh.host.id.into()),
+                health_report_entry: Some(rpc::forge::HealthReportEntry {
+                    report: Some(
+                        HealthReport::empty(format!("{HARDWARE_HEALTH_OVERRIDE_PREFIX}health"))
+                            .into(),
+                    ),
+                    ..Default::default()
+                }),
             }
+            .into_request(),
+        )
+        .await
+        .unwrap();
+    until(controller, mh, 20, InstanceState::Ready).await;
+    assert_eq!(
+        history(mh, 2).await,
+        vec![
+            assigned(InstanceState::WaitingForRebootToReady),
+            assigned(InstanceState::Ready),
+        ]
+    );
+    instance.rpc_instance().await;
+}
+
+async fn until(
+    controller: &mut StateController<MachineStateControllerIO>,
+    mh: &TestManagedHost,
+    max_iterations: u32,
+    state: InstanceState,
+) {
+    let expected = assigned(state);
+    for _ in 0..max_iterations {
+        controller.run_single_iteration().boxed().await;
+        if mh.host.machine().await.current_state() == &expected {
+            return;
         }
-        panic!(
-            "Expected Machine state condition not hit after {max_iterations} iterations; state is {:?}",
-            mh.host.machine().await.current_state()
-        );
     }
+    panic!(
+        "Expected Machine state condition not hit after {max_iterations} iterations; state is {:?}",
+        mh.host.machine().await.current_state()
+    );
 }
 
 fn assigned(instance_state: InstanceState) -> ManagedHostState {
@@ -198,11 +134,11 @@ async fn history(mh: &TestManagedHost, limit: usize) -> Vec<ManagedHostState> {
     states[states.len().saturating_sub(limit)..].to_vec()
 }
 
-fn machine_state_controller(
+pub(crate) fn instance_controller(
     harness: &TestHarness,
-    clients: &ControllerClients,
-    cancel_token: CancellationToken,
+    redfish: &Arc<RedfishSim>,
 ) -> StateController<MachineStateControllerIO> {
+    let cancel_token = CancellationToken::new();
     let api = harness.api();
     let meter = harness.test_meter.meter();
     let processor_id = uuid::Uuid::new_v4().to_string();
@@ -234,8 +170,8 @@ fn machine_state_controller(
     let services = MachineStateHandlerServices {
         db_pool: api.database_connection.clone(),
         db_reader: api.database_connection.clone().into(),
-        redfish_client_pool: clients.redfish.clone(),
-        bmc_credential_ops: clients.redfish.clone(),
+        redfish_client_pool: redfish.clone(),
+        bmc_credential_ops: redfish.clone(),
         ipmi_tool: carbide_ipmi::test_support(),
         site_config: config.machine_state_handler_site_config().into(),
         component_manager: None,

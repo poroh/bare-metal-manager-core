@@ -15,26 +15,21 @@
  * limitations under the License.
  */
 
-mod controller;
+pub(super) mod controller;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use carbide_api_core::cfg::file::{FnnConfig, FnnRoutingProfileConfig};
+use carbide_api_core::test_support::default_config;
 use carbide_api_core::test_support::network_segment::FIXTURE_TENANT_NETWORK_SEGMENT_GATEWAYS;
-use carbide_api_core::test_support::{default_config, ib_fabric_test_manager};
-use carbide_nvlink_manager::nvlink::test_support::NmxcSimClient;
-use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_secrets::credentials::{BmcCredentialType, CredentialKey, Credentials};
-use carbide_secrets::test_support::credentials::TestCredentialManager;
 use carbide_test_harness::dns::TestDomain;
+use carbide_test_harness::network::controller::TestNetworkController;
 use carbide_test_harness::prelude::*;
-use carbide_test_harness::test_support::fixture_config::FixtureDefault as _;
 use carbide_test_harness::{CarbideConfig, TestNetworkSegment};
 use carbide_uuid::machine::StableHostMachineId;
 use carbide_uuid::network::NetworkSegmentId;
 use carbide_uuid::vpc::{VpcId, VpcPrefixId};
-use controller::{ControllerClients, InstanceControllers};
 use db::ObjectColumnFilter;
 use ipnetwork::IpNetwork;
 use model::metadata::Metadata;
@@ -42,216 +37,178 @@ use model::resource_pool;
 use model::test_support::ManagedHostConfig;
 use model::vpc_prefix::VpcPrefixConfig;
 use rpc::forge::instance_interface_config::NetworkDetails;
-use tokio::sync::OnceCell;
 use tonic::IntoRequest;
 
-pub(super) struct InstanceEnv {
-    pub(super) harness: TestHarness,
-    pub(super) segment_id: NetworkSegmentId,
+/// Data returned after explicitly creating the DHCP networks used for host discovery.
+pub(super) struct BootNetworks {
     pub(super) domain: TestDomain,
-    admin_segment: TestNetworkSegment,
-    underlay_segment: TestNetworkSegment,
-    site_explorer: TestSiteExplorer,
-    instance_controllers: OnceCell<InstanceControllers>,
-    controller_clients: ControllerClients,
+    pub(super) admin: TestNetworkSegment,
+    pub(super) underlay: TestNetworkSegment,
 }
 
-impl InstanceEnv {
-    pub(super) async fn new(pool: PgPool, config: CarbideConfig) -> Self {
-        let mut pools = ResourcePoolBuilder::default()
-            .with_vlan_ids(1, 5)
-            .with_vnis(10_001, 10_005)
-            .with_integer_pool(resource_pool::common::DPA_VNI, 40_001, 40_005);
-        if config.fnn.is_some() {
-            pools = pools
-                .with_integer_pool(resource_pool::common::EXTERNAL_VPC_VNI, 50_001, 50_005)
-                .with_integer_pool(resource_pool::common::FNN_ASN, 30_001, 30_035);
-        }
-        let credentials = Arc::new(TestCredentialManager::default());
-        let ib = ib_fabric_test_manager(&config, credentials.clone());
-        let redfish = Arc::new(RedfishSim::default());
-        let nmxc = Arc::new(NmxcSimClient::default());
-        let controller_clients = ControllerClients {
-            redfish: redfish.clone(),
-            ib: ib.clone(),
-            nmxc: nmxc.clone(),
-        };
-        let harness = TestHarness::builder(pool)
-            .with_resource_pools(pools.build())
-            .with_api_builder_fn(move |builder| {
-                builder
-                    .with_runtime_config(Arc::new(config))
-                    .with_credential_manager(credentials)
-                    .with_ib_fabric_manager(ib)
-                    .with_redfish_pool(redfish)
-                    .with_nmxc_client_pool(nmxc)
-            })
+/// Creates the fixture domain and ready admin/underlay segments using the caller's controller.
+pub(super) async fn create_boot_networks(
+    harness: &TestHarness,
+    network_controller: &TestNetworkController,
+) -> BootNetworks {
+    let domain = harness.create_test_domain("dwrt1.com").await;
+    let admin = network_controller.create_admin_segment(&domain).await;
+    let underlay = network_controller.create_underlay_segment(&domain).await;
+    BootNetworks {
+        domain,
+        admin,
+        underlay,
+    }
+}
+
+/// Returns the same finite pool capacities used by the migrated instance API scenarios.
+pub(super) fn instance_resource_pools(
+    fnn_enabled: bool,
+) -> HashMap<String, resource_pool::ResourcePoolDef> {
+    let pools = ResourcePoolBuilder::default()
+        .with_vlan_ids(1, 5)
+        .with_vnis(10_001, 10_005)
+        .with_integer_pool(resource_pool::common::DPA_VNI, 40_001, 40_005);
+    if fnn_enabled {
+        pools
+            .with_integer_pool(resource_pool::common::EXTERNAL_VPC_VNI, 50_001, 50_005)
+            .with_integer_pool(resource_pool::common::FNN_ASN, 30_001, 30_035)
             .build()
-            .await;
-        let domain = harness.create_test_domain("dwrt1.com").await;
-        let network_controller = harness.network_controller();
-        let admin_segment = network_controller.create_admin_segment(&domain).await;
-        let underlay_segment = network_controller.create_underlay_segment(&domain).await;
-        let vpc_id = network_controller.create_vpc("test vpc 1").await;
-        let segment_id = network_controller
-            .create_tenant_segment(&domain, vpc_id)
-            .await
-            .id;
-        let site_explorer = harness.default_test_site_explorer();
-        Self {
-            harness,
-            segment_id,
-            domain,
-            admin_segment,
-            underlay_segment,
-            site_explorer,
-            instance_controllers: OnceCell::new(),
-            controller_clients,
-        }
+    } else {
+        pools.build()
     }
+}
 
-    pub(super) async fn tenant_segments(&self, count: usize) -> Vec<NetworkSegmentId> {
-        let vpc_id =
-            db::vpc::find_by_segment(&self.harness.api().database_connection, self.segment_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .id;
-        let mut ids = vec![self.segment_id];
-        for network in FIXTURE_TENANT_NETWORK_SEGMENT_GATEWAYS
-            .iter()
-            .take(count)
-            .skip(1)
-        {
-            ids.push(self.create_tenant_segment(vpc_id, *network, "TENANT").await);
-        }
-        ids
-    }
-
-    pub(super) async fn create_tenant_segment(
-        &self,
-        vpc_id: VpcId,
-        network: IpNetwork,
-        name: &str,
-    ) -> NetworkSegmentId {
-        let segment = self
-            .harness
+/// Discovers one host using the supplied networks/explorer and records its stable Ready fixture.
+/// Matches the API fixtures' BIOS setup, BMC credentials and agent-version defaults;
+/// instance allocation and controller progression remain separate caller actions.
+pub(super) async fn create_ready_host(
+    harness: &TestHarness,
+    site_explorer: &TestSiteExplorer,
+    boot: &BootNetworks,
+    config: ManagedHostConfig,
+) -> TestManagedHost {
+    let mut mh = harness
+        .managed_host_builder(site_explorer, boot.underlay)
+        .with_config(config)
+        .with_dpu_network_status_reported()
+        .build()
+        .await
+        .0;
+    mh.host.discover_primary_iface(boot.admin).await;
+    mh.advance_to_converged_ready().await;
+    // Completed ingestion records BIOS setup; idle Ready hosts must remain stable when
+    // the instance fixture drives the shared machine controller for a sibling host.
+    let mut txn = harness.db_txn().await;
+    db::machine::update_bios_password_set_time(&mh.host.id, txn.as_mut())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    for bmc_mac_address in
+        std::iter::once(mh.host.bmc_mac).chain(mh.dpus.iter().map(|dpu| dpu.bmc_mac))
+    {
+        harness
             .api()
-            .create_network_segment(
-                rpc::forge::NetworkSegmentCreationRequest {
-                    id: None,
-                    mtu: Some(1500),
-                    name: name.to_string(),
-                    prefixes: vec![rpc::forge::NetworkPrefix {
-                        id: None,
-                        prefix: ipnetwork::IpNetwork::new(network.network(), network.prefix())
-                            .unwrap()
-                            .to_string(),
-                        gateway: Some(network.ip().to_string()),
-                        reserve_first: 3,
-                        free_ip_count: 0,
-                        svi_ip: None,
-                        free_ip_count_v2: None,
-                        free_ip_count_saturated: false,
-                        dhcpv6_link_address: None,
-                    }],
-                    subdomain_id: Some(self.domain.id),
-                    vpc_id: Some(vpc_id),
-                    segment_type: rpc::forge::NetworkSegmentType::Tenant as i32,
-                    infer_slaac_eui64_addresses: false,
-                }
-                .into_request(),
+            .credential_manager()
+            .set_credentials(
+                &CredentialKey::BmcCredentials {
+                    credential_type: BmcCredentialType::BmcRoot { bmc_mac_address },
+                },
+                &Credentials::UsernamePassword {
+                    username: "root".to_string(),
+                    password: "notforprod".to_string(),
+                },
             )
             .await
-            .unwrap()
-            .into_inner();
-        // Get the tenant segment into ready state, as in the shared network fixtures.
-        let network_controller = self.harness.network_controller();
-        network_controller.run_single_iteration().await;
-        network_controller.run_single_iteration().await;
-        segment.id.unwrap()
+            .unwrap();
     }
-
-    pub(super) async fn advance_instance_to_ready(
-        &self,
-        mh: &TestManagedHost,
-        instance: &TestInstance,
-    ) {
-        let controllers = self
-            .instance_controllers
-            .get_or_init(|| async {
-                InstanceControllers::new(&self.harness, &self.controller_clients)
-            })
-            .await;
-        controllers
-            .advance_instance_to_ready(&self.harness, mh, instance)
-            .await;
-    }
-
-    pub(super) async fn create_managed_host(&self, config: ManagedHostConfig) -> TestManagedHost {
-        let mut mh = self
-            .harness
-            .managed_host_builder(&self.site_explorer, self.underlay_segment)
-            .with_config(config)
-            .with_dpu_network_status_reported()
-            .build()
-            .await
-            .0;
-        mh.host.discover_primary_iface(self.admin_segment).await;
-        mh.advance_to_converged_ready().await;
-        // Completed ingestion records BIOS setup; idle Ready hosts must remain stable when
-        // the instance fixture drives the shared machine controller for a sibling host.
-        let mut txn = self.harness.db_txn().await;
-        db::machine::update_bios_password_set_time(&mh.host.id, txn.as_mut())
+    for dpu in &mh.dpus {
+        let status = dpu.network_status().dpu_agent_version("test").build().await;
+        harness
+            .api()
+            .record_dpu_network_status(status.into_request())
             .await
             .unwrap();
-        txn.commit().await.unwrap();
-        for bmc_mac_address in
-            std::iter::once(mh.host.bmc_mac).chain(mh.dpus.iter().map(|dpu| dpu.bmc_mac))
-        {
-            self.harness
-                .api()
-                .credential_manager()
-                .set_credentials(
-                    &CredentialKey::BmcCredentials {
-                        credential_type: BmcCredentialType::BmcRoot { bmc_mac_address },
-                    },
-                    &Credentials::UsernamePassword {
-                        username: "root".to_string(),
-                        password: "notforprod".to_string(),
-                    },
-                )
-                .await
-                .unwrap();
-        }
-        for dpu in &mh.dpus {
-            let status = dpu.network_status().dpu_agent_version("test").build().await;
-            self.harness
-                .api()
-                .record_dpu_network_status(status.into_request())
-                .await
-                .unwrap();
-        }
-        mh
     }
+    mh
 }
 
-pub(super) struct InstanceFixture {
-    pub(super) harness: TestHarness,
-    pub(super) mh: TestManagedHost,
-    pub(super) segment_id: NetworkSegmentId,
+/// Creates one tenant segment and advances it to Ready with the caller's network controller.
+pub(super) async fn create_ready_tenant_segment(
+    api: &Api,
+    network_controller: &TestNetworkController,
+    domain: &TestDomain,
+    vpc_id: VpcId,
+    network: IpNetwork,
+    name: &str,
+) -> NetworkSegmentId {
+    let segment = api
+        .create_network_segment(
+            rpc::forge::NetworkSegmentCreationRequest {
+                id: None,
+                mtu: Some(1500),
+                name: name.to_string(),
+                prefixes: vec![rpc::forge::NetworkPrefix {
+                    id: None,
+                    prefix: ipnetwork::IpNetwork::new(network.network(), network.prefix())
+                        .unwrap()
+                        .to_string(),
+                    gateway: Some(network.ip().to_string()),
+                    reserve_first: 3,
+                    free_ip_count: 0,
+                    svi_ip: None,
+                    free_ip_count_v2: None,
+                    free_ip_count_saturated: false,
+                    dhcpv6_link_address: None,
+                }],
+                subdomain_id: Some(domain.id),
+                vpc_id: Some(vpc_id),
+                segment_type: rpc::forge::NetworkSegmentType::Tenant as i32,
+                infer_slaac_eui64_addresses: false,
+            }
+            .into_request(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    // Get the tenant segment into ready state, as in the shared network fixtures.
+
+    network_controller.run_single_iteration().await;
+    network_controller.run_single_iteration().await;
+    segment.id.unwrap()
 }
 
-impl InstanceFixture {
-    pub(super) async fn new(pool: PgPool) -> Self {
-        let env = InstanceEnv::new(pool, default_config::get()).await;
-        let mh = env.create_managed_host(ManagedHostConfig::default()).await;
-        Self {
-            harness: env.harness,
-            mh,
-            segment_id: env.segment_id,
-        }
+pub(super) async fn tenant_segments(
+    api: &Api,
+    network_controller: &TestNetworkController,
+    domain: &TestDomain,
+    segment_id: NetworkSegmentId,
+    count: usize,
+) -> Vec<NetworkSegmentId> {
+    let vpc_id = db::vpc::find_by_segment(&api.database_connection, segment_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let mut ids = vec![segment_id];
+    for network in FIXTURE_TENANT_NETWORK_SEGMENT_GATEWAYS
+        .iter()
+        .take(count)
+        .skip(1)
+    {
+        ids.push(
+            create_ready_tenant_segment(
+                api,
+                network_controller,
+                domain,
+                vpc_id,
+                *network,
+                "TENANT",
+            )
+            .await,
+        );
     }
+    ids
 }
 
 pub(super) fn default_os_config() -> rpc::forge::InstanceOperatingSystemConfig {
@@ -336,12 +293,10 @@ pub(super) fn single_interface_network_config_with_vfs(
 }
 
 pub(super) async fn find_instances_by_label(
-    env: &InstanceEnv,
+    api: &Api,
     label: rpc::forge::Label,
 ) -> rpc::forge::InstanceList {
-    let instance_ids = env
-        .harness
-        .api()
+    let instance_ids = api
         .find_instance_ids(tonic::Request::new(rpc::forge::InstanceSearchFilter {
             label: Some(label),
             tenant_org_id: None,
@@ -353,14 +308,12 @@ pub(super) async fn find_instances_by_label(
         .into_inner()
         .instance_ids;
 
-    env.harness
-        .api()
-        .find_instances_by_ids(tonic::Request::new(rpc::forge::InstancesByIdsRequest {
-            instance_ids,
-        }))
-        .await
-        .unwrap()
-        .into_inner()
+    api.find_instances_by_ids(tonic::Request::new(rpc::forge::InstancesByIdsRequest {
+        instance_ids,
+    }))
+    .await
+    .unwrap()
+    .into_inner()
 }
 
 pub(super) fn host_id(mh: &TestManagedHost) -> StableHostMachineId {
@@ -398,12 +351,12 @@ pub(super) fn fnn_config() -> CarbideConfig {
 
 /// Persists a tenant overlay prefix with explicit capacity for allocation tests.
 pub(super) async fn create_tenant_overlay_prefix_with_prefix(
-    env: &InstanceEnv,
+    pool: &PgPool,
     vpc_id: VpcId,
     name: &str,
     prefix: IpNetwork,
 ) -> VpcPrefixId {
-    let mut txn = env.harness.db_txn().await;
+    let mut txn = pool.begin().await.unwrap();
 
     // Look up the current VPC version so the prefix insert can increment it.
     let vpcs = db::vpc::find_by(
@@ -440,15 +393,13 @@ pub(super) async fn create_tenant_overlay_prefix_with_prefix(
 }
 
 pub(super) async fn create_fixture_tenant(
-    env: &InstanceEnv,
+    api: &Api,
     organization_id: impl Into<String>,
 ) -> Result<rpc::forge::Tenant, tonic::Status> {
     let organization_id = organization_id.into();
 
     // Let the API apply the runtime default routing-profile behavior.
-    let response = env
-        .harness
-        .api()
+    let response = api
         .create_tenant(tonic::Request::new(rpc::forge::CreateTenantRequest {
             organization_id: organization_id.clone(),
             routing_profile_type: None,
