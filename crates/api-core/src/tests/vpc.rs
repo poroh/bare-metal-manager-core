@@ -569,6 +569,20 @@ async fn vpc_creation_rolls_back_unencodable_symbolic_route_target(
                         .message()
                         .contains("cannot both exceed 65535")
                 );
+                // Dropping the failed transaction queues an asynchronous rollback.
+                // Wait for its VNI row lock before checking state and reusing the VNI.
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    sqlx::query(
+                        "SELECT id FROM resource_pool WHERE name = $1 AND value = $2 FOR UPDATE",
+                    )
+                    .bind(VPC_VNI)
+                    .bind(requested_vni.to_string())
+                    .fetch_one(&env.pool),
+                )
+                .await
+                .expect("VNI rollback releases its row lock")
+                .expect("rejected VNI remains in the pool");
                 let found = env
                     .api
                     .find_vpc_ids(tonic::Request::new(rpc::forge::VpcSearchFilter {
