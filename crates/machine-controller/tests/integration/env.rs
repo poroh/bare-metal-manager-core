@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use carbide_health_metrics::PerObjectMetricsRegistry;
 use carbide_machine_controller::context::MachineStateHandlerServices;
+use carbide_machine_controller::dpf::DpfOperations;
 use carbide_machine_controller::handler::{
     MachineStateHandlerBuilder, PowerOptionConfig, ReachabilityParams,
 };
@@ -31,12 +33,13 @@ use component_manager::component_manager::ComponentManager;
 use futures::FutureExt as _;
 use model::machine::slas::MachineSlaConfig;
 use state_controller::controller::StateController;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub(super) struct Env {
     pub(super) test_harness: TestHarness,
     pub(super) redfish_sim: Arc<RedfishSim>,
-    machine_controller: StateController<MachineStateControllerIO>,
+    machine_controller: Mutex<StateController<MachineStateControllerIO>>,
     _cancel_token: CancellationToken,
 }
 
@@ -45,6 +48,8 @@ pub(super) struct EnvBuilder {
     runtime_config: CarbideConfig,
     component_manager: Option<Arc<ComponentManager>>,
     credential_manager: Option<Arc<dyn CredentialManager>>,
+    dpf_sdk: Option<Arc<dyn DpfOperations>>,
+    resource_pools: Option<HashMap<String, model::resource_pool::ResourcePoolDef>>,
 }
 
 impl Env {
@@ -60,15 +65,43 @@ impl Env {
             runtime_config,
             component_manager: None,
             credential_manager: None,
+            dpf_sdk: None,
+            resource_pools: None,
         }
     }
 
     pub(super) async fn run_single_iteration(&mut self) {
-        self.machine_controller.run_single_iteration().boxed().await;
+        self.run_single_iteration_ext(true).await;
+    }
+
+    pub(super) async fn run_single_iteration_ext(&self, allow_requeue: bool) {
+        self.machine_controller
+            .lock()
+            .await
+            .run_single_iteration_ext(allow_requeue)
+            .boxed()
+            .await;
     }
 }
 
 impl EnvBuilder {
+    pub(super) fn with_resource_pools(
+        self,
+        pools: HashMap<String, model::resource_pool::ResourcePoolDef>,
+    ) -> Self {
+        Self {
+            resource_pools: Some(pools),
+            ..self
+        }
+    }
+
+    pub(super) fn with_dpf_sdk(self, dpf_sdk: Arc<dyn DpfOperations>) -> Self {
+        Self {
+            dpf_sdk: Some(dpf_sdk),
+            ..self
+        }
+    }
+
     pub(super) fn configure_runtime(mut self, configure: impl FnOnce(&mut CarbideConfig)) -> Self {
         configure(&mut self.runtime_config);
         self
@@ -94,11 +127,23 @@ impl EnvBuilder {
         let redfish_sim = Arc::new(RedfishSim::default());
         let api_redfish_sim = redfish_sim.clone();
         let api_runtime_config = Arc::new(self.runtime_config.clone());
-        let test_harness = TestHarness::builder(self.pool.clone())
+        let api_dpf_sdk = self.dpf_sdk.clone();
+        let harness_builder = TestHarness::builder(self.pool.clone());
+        let harness_builder = if let Some(pools) = &self.resource_pools {
+            harness_builder.with_resource_pools(pools.clone())
+        } else {
+            harness_builder
+        };
+        let test_harness = harness_builder
             .with_api_builder_fn(move |builder| {
-                builder
+                let builder = builder
                     .with_runtime_config(api_runtime_config)
-                    .with_redfish_pool(api_redfish_sim)
+                    .with_redfish_pool(api_redfish_sim);
+                if let Some(dpf_sdk) = api_dpf_sdk {
+                    builder.with_dpf_sdk(dpf_sdk)
+                } else {
+                    builder
+                }
             })
             .build()
             .await;
@@ -116,6 +161,8 @@ impl EnvBuilder {
             runtime_config,
             component_manager,
             credential_manager,
+            dpf_sdk,
+            resource_pools: _,
         } = self;
         let controller_redfish_sim = redfish_sim.clone();
         let runtime_config = Arc::new(runtime_config);
@@ -158,6 +205,7 @@ impl EnvBuilder {
             )
             .credential_reader(api.credential_manager().clone())
             .power_options_config(power_options)
+            .dpf_sdk(dpf_sdk)
             .build();
         let per_object_metrics_registry = PerObjectMetricsRegistry::new(
             runtime_config
@@ -226,7 +274,7 @@ impl EnvBuilder {
         Env {
             test_harness,
             redfish_sim,
-            machine_controller,
+            machine_controller: Mutex::new(machine_controller),
             _cancel_token: cancel_token,
         }
     }

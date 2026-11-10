@@ -17,6 +17,7 @@
 
 pub mod builder;
 pub mod default_config;
+pub mod extension_service;
 pub mod fixture_config;
 pub mod health;
 pub(crate) mod ib_fabric;

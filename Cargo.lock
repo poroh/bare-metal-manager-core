@@ -2773,6 +2773,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bmc-vendor",
+ "carbide-api-core",
  "carbide-api-db",
  "carbide-api-model",
  "carbide-credential-rotation",
@@ -2801,6 +2802,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
+ "ipnetwork",
  "itertools 0.14.0",
  "lazy_static",
  "libredfish",
